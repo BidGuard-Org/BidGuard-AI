@@ -1,5 +1,7 @@
 import streamlit as st
 import pandas as pd
+import json
+from src.audit_logger import log_adjudication_decision, get_all_audit_logs
 
 # Page Setup
 st.set_page_config(
@@ -33,6 +35,7 @@ st.sidebar.info("Member 2 Core Modules: Vision OCR + Statutory Compliance + Cros
 # Data Repository based on Selected Bidder
 if "Clean" in bidder_mode:
     # Bidder 101 Data
+    bidder_id = "BID-101"
     company_name = "Apex Infotech Pvt Ltd"
     gstin_no = "07AAAAA0000A1Z5"
     pan_no = "AAAAA0000A"
@@ -51,8 +54,17 @@ if "Clean" in bidder_mode:
         {"Rule Checked": "Phase 9: Legal Entity Name Match", "Status": "PASS", "Finding": "Identical normalized entity name across all certificates."},
         {"Rule Checked": "Phase 9: Turnover Reconciliation", "Status": "PASS", "Finding": "Discrepancy is 1.96% (Well within 5.0% tolerance)."}
     ]
+
+    # Phase 13 Spatial Lineage Mapping
+    current_lineage = [
+        {"document": "GST_CERTIFICATE", "field": "gstin", "value": gstin_no, "coordinates": [110, 160, 390, 200], "confidence": 0.972},
+        {"document": "GST_CERTIFICATE", "field": "legal_name", "value": company_name, "coordinates": [110, 210, 430, 250], "confidence": 0.972},
+        {"document": "PAN_CARD", "field": "pan", "value": pan_no, "coordinates": [130, 150, 360, 190], "confidence": 0.958},
+        {"document": "BALANCE_SHEET", "field": "turnover", "value": bs_turnover_val, "coordinates": [95, 180, 320, 220], "confidence": 0.946}
+    ]
 else:
     # Bidder 102 Data (Fraudulent / Conflicting)
+    bidder_id = "BID-102"
     company_name = "Apex Enterprises"
     gstin_no = "07AAAAA0000A1Z5"
     pan_no = "BBBBB9999B"  # Mismatch! Embedded PAN is AAAAA0000A
@@ -69,6 +81,14 @@ else:
         {"Rule Checked": "Phase 9: Embedded PAN inside GSTIN", "Status": "FAIL", "Finding": f"Embedded PAN '{gstin_no[2:12]}' does not match Standalone PAN '{pan_no}'."},
         {"Rule Checked": "Phase 9: Legal Entity Name Match", "Status": "PASS", "Finding": "Normalized legal business names match."},
         {"Rule Checked": "Phase 9: Turnover Reconciliation", "Status": "FAIL", "Finding": "Turnover variance 60.0% violates maximum 5.0% tolerance."}
+    ]
+
+    # Phase 13 Spatial Lineage Mapping
+    current_lineage = [
+        {"document": "GST_CERTIFICATE", "field": "gstin", "value": gstin_no, "coordinates": [110, 160, 390, 200], "confidence": 0.972},
+        {"document": "GST_CERTIFICATE", "field": "legal_name", "value": company_name, "coordinates": [110, 210, 430, 250], "confidence": 0.972},
+        {"document": "PAN_CARD", "field": "pan", "value": pan_no, "coordinates": [130, 150, 360, 190], "confidence": 0.958},
+        {"document": "BALANCE_SHEET", "field": "turnover", "value": bs_turnover_val, "coordinates": [95, 180, 320, 220], "confidence": 0.946}
     ]
 
 # UI Layout: Left Column (Document Viewer) | Right Column (Decision & Audit Trail)
@@ -157,17 +177,68 @@ with col_right:
     st.divider()
     
     # Officer Final Decision Panel
-    st.subheader("⚖️ Officer Adjudication Panel")
+    st.subheader("⚖️ Officer Adjudication Panel (Phase 13 Lineage)")
+    officer_remarks = st.text_input("Officer Audit Notes / Remarks", value="Verified against statutory procurement criteria.")
+    
     btn1, btn2, btn3 = st.columns(3)
     
     if btn1.button("✅ Approve Tender Bid", use_container_width=True):
         if inconsistencies_count > 0:
             st.error(f"❌ REJECTED BY SYSTEM: Cannot approve bid for {company_name}. Forensic cross-document conflicts detected!")
         else:
-            st.success(f"✔ APPROVED: Bid from {company_name} meets all statutory and forensic checks.")
+            event_id = log_adjudication_decision(
+                tender_id=selected_tender.split()[0],
+                bidder_id=bidder_id,
+                action="APPROVED",
+                remarks=officer_remarks,
+                lineage_data=current_lineage
+            )
+            st.success(f"✔ APPROVED: Bid from {company_name} meets all checks! Logged with Event ID: {event_id}")
             
     if btn2.button("⚠️ Request Clarification", use_container_width=True):
-        st.warning(f"Clarification memo generated for {company_name} regarding mismatched data fields.")
+        event_id = log_adjudication_decision(
+            tender_id=selected_tender.split()[0],
+            bidder_id=bidder_id,
+            action="CLARIFICATION_REQUESTED",
+            remarks=officer_remarks,
+            lineage_data=current_lineage
+        )
+        st.warning(f"Clarification memo logged for {company_name}. Event ID: {event_id}")
         
     if btn3.button("❌ Reject Submission", use_container_width=True):
-        st.error(f"Submission from {company_name} rejected under statutory procurement rules.")
+        event_id = log_adjudication_decision(
+            tender_id=selected_tender.split()[0],
+            bidder_id=bidder_id,
+            action="REJECTED",
+            remarks=officer_remarks,
+            lineage_data=current_lineage
+        )
+        st.error(f"Submission rejected under statutory rules. Event ID: {event_id}")
+
+# Phase 13: Historical Audit Trail & Lineage Ledger
+st.divider()
+with st.expander("📜 Historical Adjudication Ledger & Audit Lineage (Phase 13)", expanded=False):
+    logs = get_all_audit_logs()
+    if logs:
+        records_for_display = []
+        for log in reversed(logs):
+            records_for_display.append({
+                "Event ID": log.get("event_id"),
+                "Timestamp": log.get("timestamp"),
+                "Tender ID": log.get("tender_id"),
+                "Bidder ID": log.get("bidder_id"),
+                "Decision": log.get("adjudication", {}).get("decision"),
+                "Remarks": log.get("adjudication", {}).get("remarks"),
+                "Lineage Evidence Count": len(log.get("lineage_evidence", []))
+            })
+        st.dataframe(pd.DataFrame(records_for_display), use_container_width=True, hide_index=True)
+        
+        # Download button for audit transparency
+        st.download_button(
+            label="📥 Download Full Audit Ledger (JSON)",
+            data=json.dumps(logs, indent=4),
+            file_name="bidguard_adjudication_ledger.json",
+            mime="application/json"
+        )
+    else:
+        st.info("No adjudication events logged yet. Make a decision above to generate the first audit record.")
