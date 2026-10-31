@@ -1,3 +1,4 @@
+
 """Synthetic mock verification services for BidGuard AI.
 
 These services do not connect to real government portals.
@@ -39,6 +40,7 @@ def verify_registration(
     document_id: str | None = None,
 ) -> dict[str, Any]:
     """Simulate registration verification against extracted synthetic fields."""
+
     registry = registry.strip().upper()
     registration_number = registration_number.strip()
 
@@ -60,6 +62,7 @@ def verify_registration(
 
     fields = _load_fields()
     accepted_names = SUPPORTED_REGISTRIES[registry]
+
     matches = fields[
         fields["field_name"].str.lower().isin(accepted_names)
         & fields["normalized_value"].str.casefold().eq(
@@ -84,12 +87,34 @@ def verify_registration(
 
     match = matches.iloc[0]
 
+    registration_status = None
+
+    if registry == "GST":
+        status_rows = fields[
+            (fields["document_id"] == match["document_id"])
+            & (
+                fields["field_name"].str.lower()
+                == "registration_status"
+            )
+        ]
+
+        if not status_rows.empty:
+            registration_status = (
+                status_rows.iloc[0]["field_value"].strip().upper()
+            )
+
     return {
         "registry": registry,
         "status": "MATCHED_SYNTHETIC_RECORD",
         "verified": True,
         "synthetic": True,
         "document_id": match["document_id"],
+        "registration_status": registration_status,
+        "registration_active": (
+            registration_status == "ACTIVE"
+            if registry == "GST"
+            else None
+        ),
         "field_name": match["field_name"],
         "matched_value": match["normalized_value"],
         "confidence": (
