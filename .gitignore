@@ -13,6 +13,8 @@ env/
 
 # Environment variables / secrets
 .env
+.env.*
+!.env.example
 
 # Data
 data/raw/
@@ -23,6 +25,17 @@ models/*.pkl
 models/*.joblib
 models/*.pt
 models/*.pth
+
+# Streamlit / Dashboard temporary files
+temp_uploads/
+.streamlit/secrets.toml
+
+# Generated audit logs
+audit_ledger.json
+
+# Backups
+*.backup
+*.bak
 
 # OS files
 .DS_Store
