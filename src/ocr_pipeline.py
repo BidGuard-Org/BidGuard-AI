@@ -95,7 +95,7 @@ class DocumentOCRPipeline:
 
         return "".join(candidate)
 
-    def find_gstin(self, text: str) -> str:
+    def find_gstin(self, text: str) -> str | None:
         """
         Space-agnostic, symbol-mapped sliding window extractor for Indian GSTINs.
         """
@@ -126,7 +126,7 @@ class DocumentOCRPipeline:
 
         return None
 
-    def derive_pan_from_gstin(self, gstin: str) -> str:
+    def derive_pan_from_gstin(self, gstin: str | None) -> str | None:
         if gstin and len(gstin) == 15:
             return gstin[2:12]
         return None
@@ -153,7 +153,7 @@ class DocumentOCRPipeline:
         for raw_img in images_to_process:
             processed_img = self.preprocess_image(raw_img)
             ocr_results = self.reader.readtext(processed_img, detail=0)
-            page_text = " ".join(ocr_results)
+            page_text = " ".join(str(result) for result in ocr_results)
             extracted_text_blocks.append(page_text)
 
         full_document_text = " ".join(extracted_text_blocks)

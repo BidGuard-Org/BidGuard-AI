@@ -608,6 +608,7 @@ elif upload_mode == "Pre-loaded Benchmark Dossiers":
     risk_prob = 0.984 if is_clean else 0.967
     badge_type = "🤖 ML Model"
     risk_rating = f"{pred_risk} RISK ({risk_prob*100:.1f}%)"
+    risk_badge = f"{risk_prob*100:.1f}% (ML Model)"
 
     audit_data = [
         {"Stage": "Phase 7 Statutory", "Rule Checked": "GSTIN Identification", "Status": "PASS", "Finding Details": "Entity GSTIN registered in database."},
