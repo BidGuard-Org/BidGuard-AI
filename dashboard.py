@@ -1,4 +1,4 @@
-import os
+﻿import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -183,9 +183,9 @@ def extract_slots_and_lineage_from_ocr(ocr_results, source_doc_name):
         "pan": "NOT DETECTED",
         "issue_date": "NOT DETECTED",
         "turnover": 0.0,
-        "turnover_str": "₹ 0.0 Lakhs",
+        "turnover_str": "Rs. 0.0 Lakhs",
         "bs_turnover": 0.0,
-        "bs_turnover_str": "₹ 0.0 Lakhs"
+        "bs_turnover_str": "Rs. 0.0 Lakhs"
     }
     lineage = []
     
@@ -271,7 +271,7 @@ def extract_slots_and_lineage_from_ocr(ocr_results, source_doc_name):
         t_upper = item["text"].upper()
         if any(b_word in t_upper for b_word in business_keywords):
             if not any(hdr in t_upper for hdr in ["GOVERNMENT", "DEPARTMENT", "INCOME TAX", "CERTIFICATE", "REPORT", "AUDITOR"]):
-                c_name = item["text"].replace(":", "").replace(";", "").replace("€", "&").strip()
+                c_name = item["text"].replace(":", "").replace(";", "").replace("\u20ac", "&").strip()
                 c_name = re.sub(r'[\u0900-\u097F]', '', c_name).strip()
                 if "ENTITY" in c_name.upper():
                     c_name = c_name.split(":")[-1].strip()
@@ -293,13 +293,13 @@ def extract_slots_and_lineage_from_ocr(ocr_results, source_doc_name):
                 cand_name = ""
                 if ":" in item["text"]:
                     parts = item["text"].split(":", 1)[-1].strip()
-                    if len(parts) > 4 and not any(k in parts for k in ["कानूनी", "नाम", "व्यापार"]):
+                    if len(parts) > 4 and not any(k in parts for k in ["\u0915\u093e\u0928\u0942\u0928\u0940", "\u0928\u093e\u092e", "\u0935\u094d\u092f\u093e\u092a\u093e\u0930"]):
                         cand_name = parts
                 if not cand_name:
                     for offset in range(1, 4):
                         if idx + offset < len(extracted_items):
                             nxt = extracted_items[idx + offset]["text"].strip()
-                            if any(k in nxt for k in ["कानूनी", "नाम", "व्यापार", "Trade", "GSTIN", "PAN"]):
+                            if any(k in nxt for k in ["\u0915\u093e\u0928\u0942\u0928\u0940", "\u0928\u093e\u092e", "\u0935\u094d\u092f\u093e\u092a\u093e\u0930", "Trade", "GSTIN", "PAN"]):
                                 continue
                             clean_cand = nxt.replace(":", "").strip()
                             if len(clean_cand) > 4 and not re.search(r'\d{2}[A-Z]{5}', clean_cand):
@@ -332,61 +332,91 @@ def extract_slots_and_lineage_from_ocr(ocr_results, source_doc_name):
             })
 
     # -------------------------------------------------------------
-    # 5. TURNOVER EXTRACTION
     # -------------------------------------------------------------
-    for item in extracted_items:
-        clean_t = item["text"]
-        t_lower = clean_t.lower()
-        if any(skip_word in t_lower for skip_word in ["gstin", "pan", "udin", "date", "issue", "liability", "status"]):
-            continue
+    # 5. SOURCE-SPECIFIC TURNOVER EXTRACTION (VALUES IN LAKHS)
+    # -------------------------------------------------------------
+    is_gst = source_doc_name == "GST_CERTIFICATE"
+    is_balance_sheet = source_doc_name == "BALANCE_SHEET"
 
-        turnover_match = re.search(r'[:\-]?\s*(?:₹|Rs\.?)?\s*(\d+(?:\.\d+)?)\s*(?:Lakhs|Lakh|Cr)', clean_t, re.IGNORECASE)
-        if turnover_match:
-            try:
-                num_val = float(turnover_match.group(1))
-                if num_val > 0 and data["turnover"] == 0.0:
-                    data["turnover"] = num_val
-                    data["turnover_str"] = f"₹ {num_val} Lakhs"
-                    data["bs_turnover"] = num_val
-                    data["bs_turnover_str"] = f"₹ {num_val} Lakhs"
-                    lineage.append({
-                        "document": source_doc_name,
-                        "field": "turnover",
-                        "value": f"₹ {num_val} Lakhs",
-                        "bbox": item["bbox"],
-                        "confidence": round(item["conf"], 3)
-                    })
-                    break
-            except Exception:
-                pass
+    if is_gst or is_balance_sheet:
+        target_key = "turnover" if is_gst else "bs_turnover"
+        target_str_key = "turnover_str" if is_gst else "bs_turnover_str"
 
-    if data["turnover"] == 0.0:
-        for idx, item in enumerate(extracted_items):
-            if any(k in item["text"].upper() for k in ["TURNOVER", "कारोबार"]):
-                for offset in range(1, 3):
-                    if idx + offset < len(extracted_items):
-                        nxt_text = extracted_items[idx + offset]["text"]
-                        num_m = re.search(r'[:\-]?\s*(?:₹|Rs\.?)?\s*(\d+(?:\.\d+)?)', nxt_text)
-                        if num_m and any(c.isdigit() for c in nxt_text):
+        for item in extracted_items:
+            clean_t = item["text"]
+            t_lower = clean_t.lower()
+
+            if any(word in t_lower for word in [
+                "gstin", "pan", "udin", "date", "issue", "liability", "status"
+            ]):
+                continue
+
+            match = re.search(
+                r'[:\-]?\s*(?:Rs\.?\s*)?(\d+(?:\.\d+)?)\s*(Lakhs|Lakh|Cr|Crore)',
+                clean_t,
+                re.IGNORECASE
+            )
+
+            if match:
+                try:
+                    num_val = float(match.group(1))
+                    unit = match.group(2).lower()
+
+                    if unit in ("cr", "crore"):
+                        num_val *= 100
+
+                    if num_val > 0:
+                        data[target_key] = num_val
+                        data[target_str_key] = f"Rs. {num_val:g} Lakhs"
+                        lineage.append({
+                            "document": source_doc_name,
+                            "field": target_key,
+                            "value": f"Rs. {num_val:g} Lakhs",
+                            "bbox": item["bbox"],
+                            "confidence": round(item["conf"], 3)
+                        })
+                        break
+                except (ValueError, TypeError):
+                    pass
+
+        if data[target_key] == 0.0:
+            for idx, item in enumerate(extracted_items):
+                if "TURNOVER" in item["text"].upper():
+                    for offset in range(1, 3):
+                        if idx + offset >= len(extracted_items):
+                            continue
+
+                        next_item = extracted_items[idx + offset]
+                        num_match = re.search(
+                            r'[:\-]?\s*(?:Rs\.?\s*)?(\d+(?:\.\d+)?)\s*(Lakhs|Lakh|Cr|Crore)?',
+                            next_item["text"],
+                            re.IGNORECASE
+                        )
+
+                        if num_match:
                             try:
-                                num_val = float(num_m.group(1))
-                                if num_val > 5.0:
-                                    data["turnover"] = num_val
-                                    data["turnover_str"] = f"₹ {num_val} Lakhs"
-                                    data["bs_turnover"] = num_val
-                                    data["bs_turnover_str"] = f"₹ {num_val} Lakhs"
+                                num_val = float(num_match.group(1))
+                                unit = (num_match.group(2) or "Lakhs").lower()
+
+                                if unit in ("cr", "crore"):
+                                    num_val *= 100
+
+                                if num_val > 0:
+                                    data[target_key] = num_val
+                                    data[target_str_key] = f"Rs. {num_val:g} Lakhs"
                                     lineage.append({
                                         "document": source_doc_name,
-                                        "field": "turnover",
-                                        "value": f"₹ {num_val} Lakhs",
-                                        "bbox": extracted_items[idx + offset]["bbox"],
-                                        "confidence": round(extracted_items[idx + offset]["conf"], 3)
+                                        "field": target_key,
+                                        "value": f"Rs. {num_val:g} Lakhs",
+                                        "bbox": next_item["bbox"],
+                                        "confidence": round(next_item["conf"], 3)
                                     })
                                     break
-                            except Exception:
+                            except (ValueError, TypeError):
                                 pass
-                if data["turnover"] > 0:
-                    break
+
+                    if data[target_key] > 0:
+                        break
 
     return data, lineage, "\n".join(full_text_lines)
 
@@ -395,26 +425,26 @@ def extract_slots_and_lineage_from_ocr(ocr_results, source_doc_name):
 # =====================================================================
 st.set_page_config(
     page_title="BidGuard-AI | Officer Procurement Portal",
-    page_icon="🛡️",
+    page_icon="\U0001F6E1\uFE0F",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-st.title("🛡️ BidGuard-AI: Officer Audit & Statutory Verification Portal")
+st.title("\U0001F6E1 BidGuard-AI: Officer Audit & Statutory Verification Portal")
 st.caption("Integrated: Vision OCR (Phase 6) + Statutory Engine (Phase 7) + Predictive ML Risk (Phase 3) + Forensic Audit (Phase 9) + Ledger (Phase 13)")
 st.divider()
 
 # =====================================================================
 # SIDEBAR CONTROLS (MULTI-DOCUMENT DOSSIER)
 # =====================================================================
-st.sidebar.header("📋 Tender Specifications (NIT)")
+st.sidebar.header("\U0001F4CB Tender Specifications (NIT)")
 selected_tender = st.sidebar.selectbox(
     "Active Tender Reference",
     ["TND-2026-001 (Oil & Gas Infrastructure Pipeline)", "TND-2026-002 (Civil Works Expansion)"]
 )
 
 min_turnover_req = st.sidebar.number_input(
-    "Mandatory Minimum Turnover (₹ Lakhs)", 
+    "Mandatory Minimum Turnover (Rs. Lakhs)",
     min_value=10.0, 
     max_value=1000.0, 
     value=75.0, 
@@ -427,7 +457,7 @@ reg_cutoff_date = st.sidebar.date_input(
 )
 
 st.sidebar.divider()
-st.sidebar.header("📁 Vendor Document Dossier")
+st.sidebar.header("\U0001F4C1 Vendor Document Dossier")
 upload_mode = st.sidebar.radio(
     "Data Source Mode", 
     ["Live Multi-Document Upload (Phase 6 Integration)", "Pre-loaded Benchmark Dossiers"]
@@ -482,7 +512,7 @@ if upload_mode == "Live Multi-Document Upload (Phase 6 Integration)" and gst_fil
             data, lin, raw_text = extract_slots_and_lineage_from_ocr(ocr_res, default_doc_label)
             return data, raw_text, lin
 
-    with st.spinner("🔍 Running Multi-Document Vision Pipelines & OCR Lineage..."):
+    with st.spinner("\U0001F50D Running Multi-Document Vision Pipelines & OCR Lineage..."):
         gst_data, gst_text, gst_lin = process_file_input(gst_file, "GST_CERTIFICATE")
         current_lineage.extend(gst_lin)
         all_extracted_texts["GST Certificate"] = gst_text
@@ -500,7 +530,7 @@ if upload_mode == "Live Multi-Document Upload (Phase 6 Integration)" and gst_fil
     company_name = gst_data.get("entity_name", "UNKNOWN ENTITY")
     gstin_no = gst_data.get("gstin", "NOT FOUND")
     gst_turnover_num = gst_data.get("turnover", 0.0)
-    gst_turnover_val = gst_data.get("turnover_str", "₹ 0.0 Lakhs")
+    gst_turnover_val = gst_data.get("turnover_str", "Rs. 0.0 Lakhs")
     doc_date = gst_data.get("issue_date", "NOT FOUND")
 
     if pan_file:
@@ -519,11 +549,14 @@ if upload_mode == "Live Multi-Document Upload (Phase 6 Integration)" and gst_fil
         pan_legal_name = company_name
 
     if bs_file:
-        bs_turnover_num = bs_data.get("turnover", 0.0)
-        bs_turnover_val = bs_data.get("turnover_str", "₹ 0.0 Lakhs")
+        bs_turnover_num = bs_data.get('bs_turnover')
+        bs_turnover_val = bs_data.get('bs_turnover_str', 'NOT EXTRACTED')
+
+        if bs_turnover_num is None:
+            bs_turnover_val = 'NOT EXTRACTED'
     else:
-        bs_turnover_num = gst_turnover_num
-        bs_turnover_val = gst_turnover_val
+        bs_turnover_num = None
+        bs_turnover_val = 'NOT PROVIDED'
 
     bidder_id = f"BID-{uuid.uuid4().hex[:5].upper()}"
 
@@ -545,8 +578,8 @@ if upload_mode == "Live Multi-Document Upload (Phase 6 Integration)" and gst_fil
     }
     p7_result = compliance_engine.evaluate_bid_compliance(ocr_payload, tender_rules)
 
-    norm_gst_name = company_name.replace("€", "&").strip().upper()
-    norm_pan_name = pan_legal_name.replace("€", "&").strip().upper()
+    norm_gst_name = re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9]+", " ", company_name.upper())).strip()
+    norm_pan_name = re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9]+", " ", pan_legal_name.upper())).strip()
 
     dossier = {
         "pan_card": {
@@ -586,7 +619,7 @@ if upload_mode == "Live Multi-Document Upload (Phase 6 Integration)" and gst_fil
 
     # Execute Member 1 Predictive ML Risk Classifier
     pred_risk, risk_prob, is_ml = predict_bidder_risk(p7_result, p9_result, current_lineage)
-    badge_type = "🤖 ML Model" if is_ml else "Deterministic"
+    badge_type = "\U0001F916 ML Model" if is_ml else "Deterministic"
     risk_rating = pred_risk
     risk_badge = f"{risk_prob*100:.1f}% (ML Model)"
 
@@ -596,8 +629,8 @@ elif upload_mode == "Pre-loaded Benchmark Dossiers":
     company_name = "Apex Infotech Pvt Ltd" if is_clean else "Apex Enterprises"
     gstin_no = "07AAAAA0000A1Z5"
     pan_no = "AAAAA0000A" if is_clean else "BBBBB9999B"
-    gst_turnover_val = "₹ 85.0 Lakhs" if is_clean else "₹ 100.0 Lakhs"
-    bs_turnover_val = "₹ 85.0 Lakhs" if is_clean else "₹ 40.0 Lakhs"
+    gst_turnover_val = "Rs. 85.0 Lakhs" if is_clean else "Rs. 100.0 Lakhs"
+    bs_turnover_val = "Rs. 85.0 Lakhs" if is_clean else "Rs. 40.0 Lakhs"
     doc_date = "15/05/2026"
 
     inconsistencies_count = 0 if is_clean else 2
@@ -606,7 +639,7 @@ elif upload_mode == "Pre-loaded Benchmark Dossiers":
     # Pre-calculated Benchmark Risk Predictions
     pred_risk = "LOW" if is_clean else "HIGH"
     risk_prob = 0.984 if is_clean else 0.967
-    badge_type = "🤖 ML Model"
+    badge_type = "\U0001F916 ML Model"
     risk_rating = f"{pred_risk} RISK ({risk_prob*100:.1f}%)"
     risk_badge = f"{risk_prob*100:.1f}% (ML Model)"
 
@@ -624,7 +657,7 @@ elif upload_mode == "Pre-loaded Benchmark Dossiers":
     ]
 
 else:
-    st.info("👈 Please upload the primary **GST Certificate** in the sidebar to begin automated lineage verification.")
+    st.info("\U0001F448 Please upload the primary **GST Certificate** in the sidebar to begin automated lineage verification.")
     st.stop()
 
 # =====================================================================
@@ -633,7 +666,7 @@ else:
 col_left, col_right = st.columns([1.1, 1], gap="large")
 
 with col_left:
-    st.subheader("📄 Document Inspection & Spatial Lineage (Phase 6)")
+    st.subheader("\U0001F4C4 Document Inspection & Spatial Lineage (Phase 6)")
     
     if upload_mode == "Live Multi-Document Upload (Phase 6 Integration)":
         tabs = st.tabs(["GST Certificate", "PAN Card", "Balance Sheet"])
@@ -642,13 +675,13 @@ with col_left:
                 if gst_file.name.lower().endswith(('.png', '.jpg', '.jpeg')):
                     st.image(os.path.join("temp_uploads", gst_file.name), caption=f"GST: {gst_file.name}", use_container_width=True)
                 else:
-                    st.success(f"📁 PDF Loaded: {gst_file.name}")
+                    st.success(f"\U0001F4C1 PDF Loaded: {gst_file.name}")
         with tabs[1]:
             if pan_file:
                 if pan_file.name.lower().endswith(('.png', '.jpg', '.jpeg')):
                     st.image(os.path.join("temp_uploads", pan_file.name), caption=f"PAN: {pan_file.name}", use_container_width=True)
                 else:
-                    st.success(f"📁 PDF Loaded: {pan_file.name}")
+                    st.success(f"\U0001F4C1 PDF Loaded: {pan_file.name}")
             else:
                 st.caption("No standalone PAN card uploaded. System will use GST embedded PAN.")
         with tabs[2]:
@@ -656,11 +689,11 @@ with col_left:
                 if bs_file.name.lower().endswith(('.png', '.jpg', '.jpeg')):
                     st.image(os.path.join("temp_uploads", bs_file.name), caption=f"Balance Sheet: {bs_file.name}", use_container_width=True)
                 else:
-                    st.success(f"📁 PDF Loaded: {bs_file.name}")
+                    st.success(f"\U0001F4C1 PDF Loaded: {bs_file.name}")
             else:
                 st.caption("No Balance Sheet uploaded. Turnover matched with GST Certificate.")
 
-        with st.expander("🔎 View Raw Extracted OCR Streams", expanded=False):
+        with st.expander("\U0001F50E View Raw Extracted OCR Streams", expanded=False):
             for doc_k, doc_v in all_extracted_texts.items():
                 st.text_area(f"{doc_k} Stream", doc_v, height=120)
 
@@ -683,7 +716,7 @@ with col_left:
     )
 
 with col_right:
-    st.subheader("🔍 Automated Forensic & Compliance Scorecard")
+    st.subheader("\U0001F50D Automated Forensic & Compliance Scorecard")
     
     k1, k2, k3 = st.columns(3)
     k1.metric("Compliance Status", compliance_status)
@@ -697,15 +730,15 @@ with col_right:
     st.divider()
     
     # Officer Final Adjudication Panel (Phase 13)
-    st.subheader("⚖️ Officer Adjudication Panel (Phase 13)")
+    st.subheader("\u2696\uFE0F Officer Adjudication Panel (Phase 13)")
     officer_remarks = st.text_input("Officer Audit Notes / Remarks", value="Verified against statutory procurement criteria.")
     
     btn1, btn2, btn3 = st.columns(3)
     tender_id_ref = selected_tender.split()[0]
     
-    if btn1.button("✅ Approve Tender Bid", use_container_width=True):
+    if btn1.button("\u2705 Approve Tender Bid", use_container_width=True):
         if inconsistencies_count > 0:
-            st.error(f"❌ REJECTED BY SYSTEM: Cannot approve bid for {company_name}. Forensic cross-document conflicts detected!")
+            st.error(f"\u274C REJECTED BY SYSTEM: Cannot approve bid for {company_name}. Forensic cross-document conflicts detected!")
         else:
             evt_id = safe_log_decision(
                 tender_id=tender_id_ref,
@@ -714,10 +747,10 @@ with col_right:
                 remarks=officer_remarks,
                 lineage_data=current_lineage
             )
-            st.success(f"✔ APPROVED: Bid from {company_name} meets all checks! Event ID: {evt_id}")
+            st.success(f"\u2714 APPROVED: Bid from {company_name} meets all checks! Event ID: {evt_id}")
             st.rerun()
             
-    if btn2.button("⚠️ Request Clarification", use_container_width=True):
+    if btn2.button("\u26A0\uFE0F Request Clarification", use_container_width=True):
         evt_id = safe_log_decision(
             tender_id=tender_id_ref,
             bidder_id=bidder_id,
@@ -728,7 +761,7 @@ with col_right:
         st.warning(f"Clarification memo logged for {company_name}. Event ID: {evt_id}")
         st.rerun()
         
-    if btn3.button("❌ Reject Submission", use_container_width=True):
+    if btn3.button("\u274C Reject Submission", use_container_width=True):
         evt_id = safe_log_decision(
             tender_id=tender_id_ref,
             bidder_id=bidder_id,
@@ -743,7 +776,7 @@ with col_right:
 # HISTORICAL AUDIT LEDGER (PHASE 13)
 # =====================================================================
 st.divider()
-with st.expander("📜 Historical Adjudication Ledger & Audit Lineage (Phase 13)", expanded=False):
+with st.expander("\U0001F4DC Historical Adjudication Ledger & Audit Lineage (Phase 13)", expanded=False):
     logs = safe_get_all_logs()
     if logs:
         display_records = []
@@ -760,7 +793,7 @@ with st.expander("📜 Historical Adjudication Ledger & Audit Lineage (Phase 13)
         st.dataframe(pd.DataFrame(display_records), use_container_width=True, hide_index=True)
         
         st.download_button(
-            label="📥 Download Full Audit Ledger (JSON)",
+            label="\U0001F4E5 Download Full Audit Ledger (JSON)",
             data=json.dumps(logs, indent=4),
             file_name="bidguard_adjudication_ledger.json",
             mime="application/json"
