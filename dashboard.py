@@ -1,4 +1,4 @@
-﻿import os
+import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 os.environ["OMP_NUM_THREADS"] = "1"
 os.environ["MKL_NUM_THREADS"] = "1"
@@ -26,6 +26,17 @@ import easyocr
 from src.compliance_engine import ComplianceVerificationEngine
 from src.cross_doc_consistency import CrossDocumentConsistencyEngine
 from src.ocr_pipeline import is_valid_gstin
+from src.document_classifier import (
+    classify_document_text,
+    DOC_TYPE_PAN,
+    DOC_TYPE_GST,
+    DOC_TYPE_BALANCE_SHEET,
+    DOC_TYPE_ITR,
+    DOC_TYPE_UDYAM,
+    DOC_TYPE_UNKNOWN
+)
+from src.pan_extractor import is_valid_pan, get_pan_entity_type, compare_pan_with_gstin, extract_pan_details, mask_pan, mask_dob, mask_aadhaar
+from src.upload_workflow import DocumentStagingQueue, format_file_size
 
 # Phase 13 Audit Logger Helper
 AUDIT_LOG_FILE = "audit_ledger.json"
@@ -61,10 +72,10 @@ def predict_bidder_risk(p7_result, p9_result, lineage_records):
     """
     p7_fails = p7_result.get("failure_count", 0)
     inconsistencies = p9_result.get("inconsistency_count", 0)
-    
+
     # Total requirements across both Phase 7 & Phase 9
     total_reqs = max(len(p7_result.get("rule_details", [])) + len(p9_result.get("audit_trail", [])), 5)
-    
+
     # Combined non-compliant count
     non_compliant = p7_fails + inconsistencies
     compliant = max(0, total_reqs - non_compliant)
@@ -109,10 +120,10 @@ def predict_bidder_risk(p7_result, p9_result, lineage_records):
 
             df_feat = pd.DataFrame([features_dict])
             X_scaled = risk_scaler.transform(df_feat)
-            
+
             # Pass DataFrame to match feature names
             X_scaled_df = pd.DataFrame(X_scaled, columns=risk_scaler.feature_names_in_)
-            
+
             pred_class = risk_model.predict(X_scaled_df)[0]
             probs = risk_model.predict_proba(X_scaled_df)[0]
             class_idx = list(risk_model.classes_).index(pred_class)
@@ -148,7 +159,7 @@ def safe_log_decision(tender_id, bidder_id, action, remarks, lineage_data):
         },
         "lineage_evidence": lineage_data
     }
-    
+
     logs = []
     if os.path.exists(AUDIT_LOG_FILE):
         try:
@@ -156,11 +167,11 @@ def safe_log_decision(tender_id, bidder_id, action, remarks, lineage_data):
                 logs = json.load(f)
         except Exception:
             logs = []
-            
+
     logs.append(new_record)
     with open(AUDIT_LOG_FILE, "w", encoding="utf-8") as f:
         json.dump(logs, f, indent=4)
-        
+
     return event_id
 
 def safe_get_all_logs():
@@ -175,7 +186,7 @@ def safe_get_all_logs():
 
 def extract_slots_and_lineage_from_ocr(ocr_results, source_doc_name):
     """
-    Universal Slot Extractor: Robust against noise tokens ('TTAA'), Hindi labels, 
+    Universal Slot Extractor: Robust against noise tokens ('TTAA'), Hindi labels,
     and document variations across GST, PAN, and Balance Sheets.
     """
     data = {
@@ -189,7 +200,7 @@ def extract_slots_and_lineage_from_ocr(ocr_results, source_doc_name):
         "bs_turnover_str": "Rs. 0.0 Lakhs"
     }
     lineage = []
-    
+
     extracted_items = []
     for bbox, text, conf in ocr_results:
         clean_t = text.strip()
@@ -278,7 +289,7 @@ def extract_slots_and_lineage_from_ocr(ocr_results, source_doc_name):
     # 3. ENTITY / COMPANY / LEGAL NAME EXTRACTION
     # -------------------------------------------------------------
     business_keywords = ["PVT LTD", "PRIVATE LIMITED", "LTD", "LIMITED", "ENTERPRISES", "SOLUTIONS", "INFRA", "LOGISTICS", "INDUSTRIES", "CORP", "INC", "LLP"]
-    
+
     for item in extracted_items:
         t_upper = item["text"].upper()
         if any(b_word in t_upper for b_word in business_keywords):
@@ -457,201 +468,147 @@ selected_tender = st.sidebar.selectbox(
 
 min_turnover_req = st.sidebar.number_input(
     "Mandatory Minimum Turnover (Rs. Lakhs)",
-    min_value=10.0, 
-    max_value=1000.0, 
-    value=75.0, 
+    min_value=10.0,
+    max_value=1000.0,
+    value=75.0,
     step=5.0
 )
 
 reg_cutoff_date = st.sidebar.date_input(
-    "Mandatory Registration Cut-off Date", 
+    "Mandatory Registration Cut-off Date",
     value=pd.to_datetime("2026-12-31")
 )
 
 st.sidebar.divider()
 st.sidebar.header("\U0001F4C1 Vendor Document Dossier")
 upload_mode = st.sidebar.radio(
-    "Data Source Mode", 
+    "Data Source Mode",
     ["Live Multi-Document Upload (Phase 6 Integration)", "Pre-loaded Benchmark Dossiers"]
 )
 
-gst_file = None
-pan_file = None
-bs_file = None
+# Initialize persistent multi-document upload staging queue in session state
+if "staging_queue" not in st.session_state:
+    st.session_state["staging_queue"] = DocumentStagingQueue()
+staging_queue: DocumentStagingQueue = st.session_state["staging_queue"]
+
 bidder_selection = None
-
-if upload_mode == "Live Multi-Document Upload (Phase 6 Integration)":
-    st.sidebar.markdown("**Upload Tender Verification Documents:**")
-    gst_file = st.sidebar.file_uploader("1. GST Certificate (Required)", type=["pdf", "jpeg", "jpg", "png"], key="gst_uploader")
-    pan_file = st.sidebar.file_uploader("2. PAN Card Document (Optional / Forensic Cross-Check)", type=["pdf", "jpeg", "jpg", "png"], key="pan_uploader")
-    bs_file = st.sidebar.file_uploader("3. Audited Balance Sheet (Optional / Turnover Check)", type=["pdf", "jpeg", "jpg", "png"], key="bs_uploader")
-else:
-    bidder_selection = st.sidebar.selectbox(
-        "Select Test Dossier", 
-        ["Bidder 101: Apex Infotech (Clean Dossier)", "Bidder 102: Apex Enterprises (Fraudulent Dossier)"]
-    )
-
-compliance_engine = ComplianceVerificationEngine()
-consistency_engine = CrossDocumentConsistencyEngine(turnover_tolerance_percentage=5.0)
-
 current_lineage = []
 all_extracted_texts = {}
+pan_name = "NOT DETECTED"
+pan_name_status = "NOT_VERIFIED"
+slots = {}
 
-# =====================================================================
-# PROCESSING PIPELINE (LIVE VS BENCHMARK)
-# =====================================================================
-if upload_mode == "Live Multi-Document Upload (Phase 6 Integration)" and gst_file is not None:
-    ocr_reader = load_ocr_reader()
-    temp_dir = "temp_uploads"
-    os.makedirs(temp_dir, exist_ok=True)
+if upload_mode == "Live Multi-Document Upload (Phase 6 Integration)":
+    st.sidebar.markdown("**Upload Tender Documents (PDF, JPG, PNG):**")
+    uploaded_files = st.sidebar.file_uploader(
+        "Upload Vendor Dossier",
+        type=["pdf", "jpeg", "jpg", "png"],
+        accept_multiple_files=True,
+        key="staged_multi_file_uploader",
+        help="Upload multiple documents. Uploading files does NOT automatically run OCR. Verification only runs when requested."
+    )
 
-    def process_file_input(up_file, default_doc_label):
-        if not up_file:
-            return {}, "", []
-        f_path = os.path.join(temp_dir, up_file.name)
-        with open(f_path, "wb") as f:
-            f.write(up_file.getbuffer())
+    # Sync uploaded files to persistent staging queue without triggering OCR
+    if uploaded_files:
+        for uf in uploaded_files:
+            if uf.name not in staging_queue.documents:
+                staging_queue.add_file(uf.name, uf.getvalue())
 
-        is_pdf = up_file.name.lower().endswith('.pdf')
-        if is_pdf:
-            reader = PdfReader(f_path)
-            raw_text = "\n".join([p.extract_text() or "" for p in reader.pages])
-            pseudo_ocr = [([[0, 0], [10, 0], [10, 10], [0, 10]], line, 0.99) for line in raw_text.splitlines() if line.strip()]
-            data, lin, _ = extract_slots_and_lineage_from_ocr(pseudo_ocr, default_doc_label)
-            return data, raw_text, lin
-        else:
-            ocr_res = ocr_reader.readtext(f_path)
-            data, lin, raw_text = extract_slots_and_lineage_from_ocr(ocr_res, default_doc_label)
-            return data, raw_text, lin
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 📋 Upload Staging Queue")
+    st.sidebar.caption(f"**{len(staging_queue.documents)}** document(s) staged in queue.")
 
-    with st.spinner("\U0001F50D Running Multi-Document Vision Pipelines & OCR Lineage..."):
-        gst_data, gst_text, gst_lin = process_file_input(gst_file, "GST_CERTIFICATE")
-        current_lineage.extend(gst_lin)
-        all_extracted_texts["GST Certificate"] = gst_text
+    if staging_queue.documents:
+        for doc_name, doc_obj in list(staging_queue.documents.items()):
+            col_q1, col_q2 = st.sidebar.columns([3, 1])
+            status_badge = "✅ Verified" if doc_obj.status == "Verified" else "⏳ Queued"
+            col_q1.markdown(f"**{doc_name}**<br><small>{doc_obj.size_formatted} | {doc_obj.detected_type} | {status_badge}</small>", unsafe_allow_html=True)
+            if col_q2.button("✖", key=f"del_{doc_name}", help=f"Remove {doc_name} from queue"):
+                staging_queue.remove_file(doc_name)
+                st.rerun()
 
-        pan_data, pan_text, pan_lin = process_file_input(pan_file, "PAN_CARD")
-        if pan_lin:
-            current_lineage.extend(pan_lin)
-            all_extracted_texts["PAN Card"] = pan_text
+        if st.sidebar.button("🗑️ Clear All Files", use_container_width=True):
+            staging_queue.clear()
+            st.rerun()
 
-        bs_data, bs_text, bs_lin = process_file_input(bs_file, "BALANCE_SHEET")
-        if bs_lin:
-            current_lineage.extend(bs_lin)
-            all_extracted_texts["Balance Sheet"] = bs_text
+        st.sidebar.markdown("---")
+        verify_clicked = st.sidebar.button(
+            "🔍 Verify All Documents",
+            type="primary",
+            use_container_width=True,
+            help="Executes Vision OCR, pattern classification, slot extraction, and statutory compliance checks."
+        )
 
-    company_name = gst_data.get("entity_name", "UNKNOWN ENTITY")
-    gstin_no = gst_data.get("gstin", "NOT FOUND")
-    gst_turnover_num = gst_data.get("turnover", 0.0)
-    gst_turnover_val = gst_data.get("turnover_str", "Rs. 0.0 Lakhs")
-    doc_date = gst_data.get("issue_date", "NOT FOUND")
+        if verify_clicked:
+            with st.spinner("\U0001F50D Running Multi-Document Vision Pipelines & Forensic Lineage..."):
+                ocr_reader = load_ocr_reader()
+                staging_queue.execute_consolidated_verification(
+                    ocr_reader=ocr_reader,
+                    min_turnover_req=float(min_turnover_req),
+                    reg_cutoff_date=str(reg_cutoff_date.strftime("%d/%m/%Y"))
+                )
+            st.rerun()
 
-    if pan_file:
-        pan_no = pan_data.get("pan") if pan_data.get("pan") != "NOT DETECTED" else gst_data.get("pan", "NOT FOUND")
-        p_name = pan_data.get("entity_name", "NOT DETECTED")
-        if p_name != "NOT DETECTED" and len(p_name) >= 4:
-            pan_legal_name = p_name
-        else:
-            pan_legal_name = "NOT DETECTED"
-            if company_name and company_name != "UNKNOWN ENTITY":
-                norm_company = re.sub(r'[^A-Z0-9 ]+', '', company_name.upper()).strip()
-                company_tokens = [tok for tok in norm_company.split() if len(tok) > 3 and tok not in ["PVT", "LTD", "LIMITED", "PRIVATE"]]
-                for line in pan_text.splitlines():
-                    clean_line = re.sub(r'[^A-Z0-9 ]+', '', line.upper()).strip()
-                    if norm_company in clean_line or (company_tokens and all(tok in clean_line for tok in company_tokens)):
-                        pan_legal_name = company_name
-                        break
+        if not staging_queue.is_verified:
+            st.info("👈 Staged documents are ready. Click **'🔍 Verify All Documents'** in the sidebar to run analysis.")
+            st.markdown("### 📋 Upload Staging Queue")
+            df_queue = pd.DataFrame(staging_queue.get_queue_summary())
+            st.dataframe(df_queue, use_container_width=True, hide_index=True)
+            st.stop()
+
+        # Retrieve cached results without repeating OCR
+        res = staging_queue.verification_results
+        current_lineage = res["all_lineage"]
+        all_extracted_texts = res["all_extracted_texts"]
+        audit_data = res["audit_data"]
+        compliance_status = res["compliance_status"]
+        inconsistencies_count = res["discrepancies_count"]
+        slots = res["slots"]
+        company_name = slots["company_name"]
+        gstin_no = slots["gstin_no"]
+        pan_no = slots["pan_no"]
+        pan_name = slots["pan_name"]
+        pan_name_status = slots["pan_name_status"]
+        pan_entity_type = slots.get("pan_entity_type", "UNKNOWN")
+        father_name = slots.get("father_name")
+        father_name_status = slots.get("father_name_status", "NOT_VERIFIED")
+        dob = slots.get("dob")
+        dob_status = slots.get("dob_status", "NOT_VERIFIED")
+        masked_pan = slots.get("masked_pan") or mask_pan(pan_no)
+        masked_dob = slots.get("masked_dob") or (mask_dob(dob) if dob else "NOT DETECTED")
+        gst_turnover_val = slots["gst_turnover_val"]
+        bs_turnover_val = slots["bs_turnover_val"]
+        doc_date = slots["doc_date"]
+        bidder_id = f"BID-{uuid.uuid4().hex[:5].upper()}"
+
+        # Execute Member 1 Predictive ML Risk Classifier
+        pred_risk, risk_prob, is_ml = predict_bidder_risk(res["p7_result"], res["p9_result"], current_lineage)
+        badge_type = "\U0001F916 ML Model" if is_ml else "Deterministic"
+        risk_rating = pred_risk
+        risk_badge = f"{risk_prob*100:.1f}% (ML Model)"
     else:
-        pan_no = gst_data.get("pan", "NOT FOUND")
-        pan_legal_name = company_name
-
-    if bs_file:
-        bs_turnover_num = bs_data.get('bs_turnover')
-        bs_turnover_val = bs_data.get('bs_turnover_str', 'NOT EXTRACTED')
-
-        if bs_turnover_num is None:
-            bs_turnover_val = 'NOT EXTRACTED'
-    else:
-        bs_turnover_num = None
-        bs_turnover_val = 'NOT PROVIDED'
-
-    bidder_id = f"BID-{uuid.uuid4().hex[:5].upper()}"
-
-    ocr_payload = {
-        "document_id": gst_file.name,
-        "total_pages": 1,
-        "extracted_fields": {
-            "entity_name": company_name,
-            "gstin": gstin_no,
-            "pan": pan_no,
-            "turnover": gst_turnover_num,
-            "detected_date": doc_date
-        }
-    }
-
-    tender_rules = {
-        "min_turnover": float(min_turnover_req),
-        "tender_submission_date": str(reg_cutoff_date.strftime("%d/%m/%Y"))
-    }
-    p7_result = compliance_engine.evaluate_bid_compliance(ocr_payload, tender_rules)
-
-    norm_gst_name = re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9]+", " ", company_name.upper())).strip()
-    norm_pan_name = re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9]+", " ", pan_legal_name.upper())).strip()
-
-    dossier = {
-        "pan_card": {
-            "pan_number": pan_no, 
-            "legal_name": norm_pan_name
-        },
-        "gst_certificate": {
-            "gstin": gstin_no, 
-            "legal_name": norm_gst_name, 
-            "annual_turnover": gst_turnover_num
-        },
-        "balance_sheet": {
-            "audited_turnover": bs_turnover_num
-        }
-    }
-      
-    p9_result = consistency_engine.evaluate_dossier_consistency(dossier)
-
-    audit_data = []
-    for r in p7_result["rule_details"]:
-        audit_data.append({
-            "Stage": "Phase 7 Statutory",
-            "Rule Checked": r["rule"],
-            "Status": "PASS" if r["passed"] else "FAIL",
-            "Finding Details": r.get("reason") or "Rule requirement satisfied."
-        })
-    for c in p9_result["audit_trail"]:
-        audit_data.append({
-            "Stage": "Phase 9 Forensic",
-            "Rule Checked": c["check"],
-            "Status": c["status"],
-            "Finding Details": c.get("reason") or "Cross-document verification passed."
-        })
-
-    inconsistencies_count = p7_result["failure_count"] + p9_result["inconsistency_count"]
-    compliance_status = "PASSED" if inconsistencies_count == 0 else "FLAGGED"
-
-    # Execute Member 1 Predictive ML Risk Classifier
-    pred_risk, risk_prob, is_ml = predict_bidder_risk(p7_result, p9_result, current_lineage)
-    badge_type = "\U0001F916 ML Model" if is_ml else "Deterministic"
-    risk_rating = pred_risk
-    risk_badge = f"{risk_prob*100:.1f}% (ML Model)"
-
+        st.info("👈 Please upload vendor documents (GST Certificate, PAN Card, Balance Sheet, etc.) in the sidebar to begin.")
+        st.stop()
 elif upload_mode == "Pre-loaded Benchmark Dossiers":
     is_clean = "Clean" in (bidder_selection or "")
     bidder_id = "BID-101" if is_clean else "BID-102"
     company_name = "Apex Infotech Pvt Ltd" if is_clean else "Apex Enterprises"
     gstin_no = "07AAAAA0000A1Z5"
     pan_no = "AAAAA0000A" if is_clean else "BBBBB9999B"
+    pan_entity_type = "Company" if is_clean else "Individual / Person"
+    father_name = None if is_clean else "Suresh Kumar"
+    father_name_status = "NOT_APPLICABLE" if is_clean else "VERIFIED"
+    dob = "15/05/2018" if is_clean else "12/08/1985"
+    dob_status = "VERIFIED"
+    masked_pan = mask_pan(pan_no)
+    masked_dob = mask_dob(dob)
     gst_turnover_val = "Rs. 85.0 Lakhs" if is_clean else "Rs. 100.0 Lakhs"
     bs_turnover_val = "Rs. 85.0 Lakhs" if is_clean else "Rs. 40.0 Lakhs"
     doc_date = "15/05/2026"
 
     inconsistencies_count = 0 if is_clean else 2
     compliance_status = "PASSED" if is_clean else "FLAGGED"
-    
+
     audit_data = [
         {"Stage": "Phase 7 Statutory", "Rule Checked": "GSTIN Identification", "Status": "PASS", "Finding Details": "Entity GSTIN registered in database."},
         {"Stage": "Phase 7 Statutory", "Rule Checked": "Turnover Threshold", "Status": "PASS", "Finding Details": "Declared turnover meets tender limit."},
@@ -698,35 +655,32 @@ col_left, col_right = st.columns([1.1, 1], gap="large")
 
 with col_left:
     st.subheader("\U0001F4C4 Document Inspection & Spatial Lineage (Phase 6)")
-    
+
     if upload_mode == "Live Multi-Document Upload (Phase 6 Integration)":
-        tabs = st.tabs(["GST Certificate", "PAN Card", "Balance Sheet"])
-        with tabs[0]:
-            if gst_file:
-                if gst_file.name.lower().endswith(('.png', '.jpg', '.jpeg')):
-                    st.image(os.path.join("temp_uploads", gst_file.name), caption=f"GST: {gst_file.name}", use_container_width=True)
-                else:
-                    st.success(f"\U0001F4C1 PDF Loaded: {gst_file.name}")
-        with tabs[1]:
-            if pan_file:
-                if pan_file.name.lower().endswith(('.png', '.jpg', '.jpeg')):
-                    st.image(os.path.join("temp_uploads", pan_file.name), caption=f"PAN: {pan_file.name}", use_container_width=True)
-                else:
-                    st.success(f"\U0001F4C1 PDF Loaded: {pan_file.name}")
-            else:
-                st.caption("No standalone PAN card uploaded. System will use GST embedded PAN.")
-        with tabs[2]:
-            if bs_file:
-                if bs_file.name.lower().endswith(('.png', '.jpg', '.jpeg')):
-                    st.image(os.path.join("temp_uploads", bs_file.name), caption=f"Balance Sheet: {bs_file.name}", use_container_width=True)
-                else:
-                    st.success(f"\U0001F4C1 PDF Loaded: {bs_file.name}")
-            else:
-                st.caption("No Balance Sheet uploaded. Turnover matched with GST Certificate.")
+        doc_names = list(staging_queue.documents.keys())
+        if doc_names:
+            tab_labels = [f"{staging_queue.documents[dn].detected_type}: {dn}" for dn in doc_names]
+            tabs = st.tabs(tab_labels)
+            for idx, dn in enumerate(doc_names):
+                doc_obj = staging_queue.documents[dn]
+                with tabs[idx]:
+                    st.caption(f"**Document Type:** {doc_obj.detected_type} (Confidence: {doc_obj.classification_confidence:.1%}) | **Size:** {doc_obj.size_formatted} | **Status:** {doc_obj.status}")
+                    f_path = os.path.join("temp_uploads", dn)
+                    if dn.lower().endswith(('.png', '.jpg', '.jpeg')) and os.path.exists(f_path):
+                        st.image(f_path, caption=f"{doc_obj.detected_type}: {dn}", use_container_width=True)
+                    else:
+                        st.success(f"\U0001F4C1 Document File: {dn} ({doc_obj.size_formatted})")
+                    if doc_obj.extracted_fields:
+                        st.json(doc_obj.extracted_fields)
+
 
         with st.expander("\U0001F50E View Raw Extracted OCR Streams", expanded=False):
             for doc_k, doc_v in all_extracted_texts.items():
-                st.text_area(f"{doc_k} Stream", doc_v, height=120)
+                st.text_area(f"{doc_k} Stream", mask_aadhaar(doc_v), height=120)
+
+    pan_extra = f"[{pan_entity_type}] &bull; Masked: <code>{masked_pan}</code>" if pan_no != "NOT FOUND" else ""
+    father_display = father_name if father_name else ("Not Applicable (Corporate Entity)" if pan_entity_type in ["Company", "Firm / Limited Liability Partnership (LLP)", "Trust"] else "NOT DETECTED")
+    dob_display = f"{dob} (Masked: {masked_dob})" if dob and dob != "NOT DETECTED" else "NOT DETECTED"
 
     st.markdown(
         f"""
@@ -737,7 +691,10 @@ with col_left:
             </div>
             <p><strong>Legal Entity Name:</strong> <mark style="background-color: #2e7d32; color: white; padding: 2px 6px; border-radius: 4px;">{company_name}</mark></p>
             <p><strong>GSTIN Number:</strong> <mark style="background-color: #1565c0; color: white; padding: 2px 6px; border-radius: 4px;">{gstin_no}</mark></p>
-            <p><strong>Permanent Account Number (PAN):</strong> <mark style="background-color: #e65100; color: white; padding: 2px 6px; border-radius: 4px;">{pan_no}</mark></p>
+            <p><strong>Permanent Account Number (PAN):</strong> <mark style="background-color: #e65100; color: white; padding: 2px 6px; border-radius: 4px;">{pan_no}</mark> <span style="font-size: 0.85em; color: #bbb;">{pan_extra}</span></p>
+            <p><strong>PAN Cardholder / Legal Name:</strong> <mark style="background-color: #4a148c; color: white; padding: 2px 6px; border-radius: 4px;">{pan_name}</mark> <span style="font-size: 0.85em; color: #bbb;">[{pan_name_status}]</span></p>
+            <p><strong>Father's Name (Individual PAN):</strong> <strong>{father_display}</strong></p>
+            <p><strong>Date of Birth / Incorporation:</strong> <strong>{dob_display}</strong></p>
             <p><strong>Declared GST Turnover:</strong> <strong>{gst_turnover_val}</strong></p>
             <p><strong>Audited Balance Sheet Turnover:</strong> <strong>{bs_turnover_val}</strong></p>
             <p><strong>Issue / Certification Date:</strong> {doc_date}</p>
@@ -746,27 +703,41 @@ with col_left:
         unsafe_allow_html=True
     )
 
+    if slots.get("multi_pan_count", 0) > 1:
+        st.markdown(f"##### 👥 Associated Partner / Signatory PAN Records ({slots.get('multi_pan_count')})")
+        secondary_pans = []
+        for p in slots.get("all_pan_extractions", []):
+            p_fields = p.get("fields", {})
+            secondary_pans.append({
+                "Document": p.get("filename"),
+                "PAN": mask_pan(p_fields.get("pan")),
+                "Entity Type": p_fields.get("entity_type", "UNKNOWN"),
+                "Holder Name": p_fields.get("cardholder_name", "NOT DETECTED"),
+                "Status": p_fields.get("name_status", "NOT_VERIFIED")
+            })
+        st.dataframe(pd.DataFrame(secondary_pans), use_container_width=True, hide_index=True)
+
 with col_right:
     st.subheader("\U0001F50D Automated Forensic & Compliance Scorecard")
-    
+
     k1, k2, k3 = st.columns(3)
     k1.metric("Compliance Status", compliance_status)
     k2.metric("Discrepancies", f"{inconsistencies_count} Found")
     k3.metric("Assigned Risk", f"{risk_rating} RISK", delta=risk_badge)
-    
+
     st.markdown("#### Lineage Verification Audit Trail")
     df_audit = pd.DataFrame(audit_data)
     st.dataframe(df_audit, use_container_width=True, hide_index=True)
-    
+
     st.divider()
-    
+
     # Officer Final Adjudication Panel (Phase 13)
     st.subheader("\u2696\uFE0F Officer Adjudication Panel (Phase 13)")
     officer_remarks = st.text_input("Officer Audit Notes / Remarks", value="Verified against statutory procurement criteria.")
-    
+
     btn1, btn2, btn3 = st.columns(3)
     tender_id_ref = selected_tender.split()[0]
-    
+
     if btn1.button("\u2705 Approve Tender Bid", use_container_width=True):
         if inconsistencies_count > 0:
             st.error(f"\u274C REJECTED BY SYSTEM: Cannot approve bid for {company_name}. Forensic cross-document conflicts detected!")
@@ -780,7 +751,7 @@ with col_right:
             )
             st.success(f"\u2714 APPROVED: Bid from {company_name} meets all checks! Event ID: {evt_id}")
             st.rerun()
-            
+
     if btn2.button("\u26A0\uFE0F Request Clarification", use_container_width=True):
         evt_id = safe_log_decision(
             tender_id=tender_id_ref,
@@ -791,7 +762,7 @@ with col_right:
         )
         st.warning(f"Clarification memo logged for {company_name}. Event ID: {evt_id}")
         st.rerun()
-        
+
     if btn3.button("\u274C Reject Submission", use_container_width=True):
         evt_id = safe_log_decision(
             tender_id=tender_id_ref,
@@ -822,7 +793,7 @@ with st.expander("\U0001F4DC Historical Adjudication Ledger & Audit Lineage (Pha
                 "Lineage Evidence Fields": len(l.get("lineage_evidence", []))
             })
         st.dataframe(pd.DataFrame(display_records), use_container_width=True, hide_index=True)
-        
+
         st.download_button(
             label="\U0001F4E5 Download Full Audit Ledger (JSON)",
             data=json.dumps(logs, indent=4),
