@@ -25,6 +25,7 @@ import easyocr
 # =====================================================================
 from src.compliance_engine import ComplianceVerificationEngine
 from src.cross_doc_consistency import CrossDocumentConsistencyEngine
+from src.ocr_pipeline import is_valid_gstin
 
 # Phase 13 Audit Logger Helper
 AUDIT_LOG_FILE = "audit_ledger.json"
@@ -211,16 +212,19 @@ def extract_slots_and_lineage_from_ocr(ocr_results, source_doc_name):
             cand = list(gstin_match.group(1))
             if cand[0] in ['O', 'D']: cand[0] = '0'
             if cand[1] in ['O', 'D']: cand[1] = '0'
-            cand[13] = 'Z'
-            data["gstin"] = "".join(cand)
-            lineage.append({
-                "document": source_doc_name,
-                "field": "gstin",
-                "value": data["gstin"],
-                "bbox": item["bbox"],
-                "confidence": round(item["conf"], 3)
-            })
-            break
+            if cand[13] in ['2', '7', 'C', 'c', 'z', '€', 'Γé¼']:
+                cand[13] = 'Z'
+            cand_str = "".join(cand)
+            if is_valid_gstin(cand_str, verify_checksum=True):
+                data["gstin"] = cand_str
+                lineage.append({
+                    "document": source_doc_name,
+                    "field": "gstin",
+                    "value": data["gstin"],
+                    "bbox": item["bbox"],
+                    "confidence": round(item["conf"], 3)
+                })
+                break
 
     # Backup GSTIN search by keyword
     if data["gstin"] == "NOT DETECTED":
@@ -230,16 +234,24 @@ def extract_slots_and_lineage_from_ocr(ocr_results, source_doc_name):
                 if not val and idx + 1 < len(extracted_items):
                     val = extracted_items[idx + 1]["text"].strip()
                 cleaned_val = re.sub(r'[^A-Za-z0-9]', '', val).upper()
-                if len(cleaned_val) >= 14:
-                    data["gstin"] = cleaned_val[:15]
-                    lineage.append({
-                        "document": source_doc_name,
-                        "field": "gstin",
-                        "value": data["gstin"],
-                        "bbox": item["bbox"],
-                        "confidence": round(item["conf"], 3)
-                    })
-                    break
+                if len(cleaned_val) >= 15:
+                    cand_backup = cleaned_val[:15]
+                    cand_list = list(cand_backup)
+                    if cand_list[0] in ['O', 'D']: cand_list[0] = '0'
+                    if cand_list[1] in ['O', 'D']: cand_list[1] = '0'
+                    if cand_list[13] in ['2', '7', 'C', 'c', 'z', '€', 'Γé¼']:
+                        cand_list[13] = 'Z'
+                    cand_backup_str = "".join(cand_list)
+                    if is_valid_gstin(cand_backup_str, verify_checksum=True):
+                        data["gstin"] = cand_backup_str
+                        lineage.append({
+                            "document": source_doc_name,
+                            "field": "gstin",
+                            "value": data["gstin"],
+                            "bbox": item["bbox"],
+                            "confidence": round(item["conf"], 3)
+                        })
+                        break
 
     # -------------------------------------------------------------
     # 2. STANDALONE PAN EXTRACTION (FORENSIC PRIORITY)
@@ -453,7 +465,7 @@ min_turnover_req = st.sidebar.number_input(
 
 reg_cutoff_date = st.sidebar.date_input(
     "Mandatory Registration Cut-off Date", 
-    value=pd.to_datetime("2026-01-01")
+    value=pd.to_datetime("2026-12-31")
 )
 
 st.sidebar.divider()
@@ -536,14 +548,18 @@ if upload_mode == "Live Multi-Document Upload (Phase 6 Integration)" and gst_fil
     if pan_file:
         pan_no = pan_data.get("pan") if pan_data.get("pan") != "NOT DETECTED" else gst_data.get("pan", "NOT FOUND")
         p_name = pan_data.get("entity_name", "NOT DETECTED")
-        if p_name == "NOT DETECTED" or len(p_name) < 4:
-            comp_first_word = company_name.split()[0].upper() if company_name != "UNKNOWN ENTITY" else "SHREEYA"
-            if any(comp_first_word in line.upper() for line in pan_text.splitlines()):
-                pan_legal_name = company_name
-            else:
-                pan_legal_name = p_name
-        else:
+        if p_name != "NOT DETECTED" and len(p_name) >= 4:
             pan_legal_name = p_name
+        else:
+            pan_legal_name = "NOT DETECTED"
+            if company_name and company_name != "UNKNOWN ENTITY":
+                norm_company = re.sub(r'[^A-Z0-9 ]+', '', company_name.upper()).strip()
+                company_tokens = [tok for tok in norm_company.split() if len(tok) > 3 and tok not in ["PVT", "LTD", "LIMITED", "PRIVATE"]]
+                for line in pan_text.splitlines():
+                    clean_line = re.sub(r'[^A-Z0-9 ]+', '', line.upper()).strip()
+                    if norm_company in clean_line or (company_tokens and all(tok in clean_line for tok in company_tokens)):
+                        pan_legal_name = company_name
+                        break
     else:
         pan_no = gst_data.get("pan", "NOT FOUND")
         pan_legal_name = company_name
@@ -636,13 +652,6 @@ elif upload_mode == "Pre-loaded Benchmark Dossiers":
     inconsistencies_count = 0 if is_clean else 2
     compliance_status = "PASSED" if is_clean else "FLAGGED"
     
-    # Pre-calculated Benchmark Risk Predictions
-    pred_risk = "LOW" if is_clean else "HIGH"
-    risk_prob = 0.984 if is_clean else 0.967
-    badge_type = "\U0001F916 ML Model"
-    risk_rating = f"{pred_risk} RISK ({risk_prob*100:.1f}%)"
-    risk_badge = f"{risk_prob*100:.1f}% (ML Model)"
-
     audit_data = [
         {"Stage": "Phase 7 Statutory", "Rule Checked": "GSTIN Identification", "Status": "PASS", "Finding Details": "Entity GSTIN registered in database."},
         {"Stage": "Phase 7 Statutory", "Rule Checked": "Turnover Threshold", "Status": "PASS", "Finding Details": "Declared turnover meets tender limit."},
@@ -655,6 +664,28 @@ elif upload_mode == "Pre-loaded Benchmark Dossiers":
         {"document": "GST_CERTIFICATE", "field": "gstin", "value": gstin_no, "bbox": [110, 160, 390, 200], "confidence": 0.972},
         {"document": "PAN_CARD", "field": "pan", "value": pan_no, "bbox": [130, 150, 360, 190], "confidence": 0.958}
     ]
+
+    benchmark_p7 = {
+        "failure_count": 0,
+        "rule_details": [
+            {"rule": "GSTIN Identification", "passed": True},
+            {"rule": "Turnover Threshold", "passed": True},
+            {"rule": "Document Validity", "passed": True}
+        ]
+    }
+    benchmark_p9 = {
+        "inconsistency_count": 0 if is_clean else 2,
+        "audit_trail": [
+            {"check": "PAN Embedded inside GSTIN", "status": "PASS" if is_clean else "FAIL"},
+            {"check": "Turnover Variance (GST vs Balance Sheet)", "status": "PASS" if is_clean else "FAIL"}
+        ]
+    }
+
+    # Execute actual ML Model inference for benchmark dossiers
+    pred_risk, risk_prob, is_ml = predict_bidder_risk(benchmark_p7, benchmark_p9, current_lineage)
+    badge_type = "\U0001F916 ML Model" if is_ml else "Deterministic"
+    risk_rating = f"{pred_risk} RISK ({risk_prob*100:.1f}%)"
+    risk_badge = f"{risk_prob*100:.1f}% ({'ML Model' if is_ml else 'Deterministic'})"
 
 else:
     st.info("\U0001F448 Please upload the primary **GST Certificate** in the sidebar to begin automated lineage verification.")

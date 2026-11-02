@@ -34,9 +34,18 @@ class ComplianceVerificationEngine:
             "reason": None if passed else f"Value {extracted_value} is below mandatory threshold {required_value}."
         }
 
-    def check_validity_date(self, detected_date_str: str, tender_submission_date: str = None, rule_name: str = "Certificate Validity") -> Dict[str, Any]:
+    def check_validity_date(
+        self,
+        detected_date_str: str,
+        tender_submission_date: str = None,
+        rule_name: str = "Certificate Validity",
+        is_expiry: bool = False
+    ) -> Dict[str, Any]:
         """
-        DATE_CHECK: Verifies if certificate expiry date is after the tender submission date.
+        DATE_CHECK:
+        - If is_expiry=True: Verifies if certificate expiry date is on or after the reference date (doc_date >= ref_date).
+        - If is_expiry=False (default for registration/issue dates): Verifies if entity was registered on or before
+          the cut-off reference date (doc_date <= ref_date).
         """
         if not detected_date_str:
             return {
@@ -74,7 +83,13 @@ class ComplianceVerificationEngine:
                 except ValueError:
                     pass
 
-        is_valid = doc_date >= ref_date
+        if is_expiry:
+            is_valid = doc_date >= ref_date
+            fail_reason = f"Certificate expired on {doc_date} (Reference: {ref_date})."
+        else:
+            is_valid = doc_date <= ref_date
+            fail_reason = f"Certificate registration date {doc_date} is after mandatory cut-off date {ref_date}."
+
         return {
             "rule": rule_name,
             "type": "DATE_CHECK",
@@ -82,7 +97,7 @@ class ComplianceVerificationEngine:
             "document_date": str(doc_date),
             "reference_date": str(ref_date),
             "passed": is_valid,
-            "reason": None if is_valid else f"Certificate expired on {doc_date} (Reference: {ref_date})."
+            "reason": None if is_valid else fail_reason
         }
 
     def check_field_match(self, extracted_value: str, reference_value: str, rule_name: str = "Identity/GST Match") -> Dict[str, Any]:
@@ -129,12 +144,18 @@ class ComplianceVerificationEngine:
             )
             results.append(gst_res)
 
-        # 2. Date/Expiry Check
+        # 2. Date/Registration Check
         if "detected_date" in extracted_fields:
+            is_expiry = tender_requirements.get("is_expiry", False)
+            rule_name = tender_requirements.get(
+                "date_rule_name",
+                "Document Expiry Check" if is_expiry else "Document Validity Check"
+            )
             date_res = self.check_validity_date(
                 extracted_fields.get("detected_date"),
                 tender_requirements.get("tender_submission_date"),
-                rule_name="Document Validity Check"
+                rule_name=rule_name,
+                is_expiry=is_expiry
             )
             results.append(date_res)
 
@@ -169,7 +190,7 @@ if __name__ == "__main__":
         "document_id": "DOC-0001",
         "extracted_fields": {
             "gstin": "07AAAAA0000A1Z5",
-            "detected_date": "12/04/2027",
+            "detected_date": "14/05/2024",
             "turnover": 6.5
         }
     }

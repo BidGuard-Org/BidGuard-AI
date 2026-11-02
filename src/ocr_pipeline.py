@@ -5,6 +5,93 @@ import easyocr
 import re
 from typing import Dict, Any, List
 
+CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+
+def compute_gstin_checksum(gstin14: str) -> str:
+    """Calculates ISO 7064 Mod 36,10 (Luhn Mod 36) check digit for Indian GSTIN."""
+    total = 0
+    for i, c in enumerate(gstin14):
+        val = CHARS.index(c)
+        factor = 1 if (i % 2 == 0) else 2
+        prod = val * factor
+        total += (prod // 36) + (prod % 36)
+    check_code = (36 - (total % 36)) % 36
+    return CHARS[check_code]
+
+def is_valid_gstin(gstin: str, verify_checksum: bool = True) -> bool:
+    """
+    Validates Indian GSTIN format and optional ISO 7064 Mod 36,10 check digit.
+    State Code: 01-38, 97, 99
+    PAN: 5 Alpha + 4 Digits + 1 Alpha
+    Entity: 1 Alphanum (1-9, A-Z)
+    Default: 'Z'
+    Check Code: Alphanum
+    """
+    gstin = gstin.strip().upper()
+    if not re.match(r"^(0[1-9]|[1-2][0-9]|3[0-8]|97|99)[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$", gstin):
+        return False
+    if not verify_checksum:
+        return True
+    try:
+        return gstin[14] == compute_gstin_checksum(gstin[:14])
+    except Exception:
+        return False
+
+def validate_gstin_checksum(gstin: str) -> Dict[str, Any]:
+    """
+    Validates Indian GSTIN format and ISO 7064 Mod 36,10 check digit.
+
+    Clearly reports structural format or checksum failures and explicitly notes
+    that this is an offline mathematical check, NOT a government-verified failure
+    or live portal rejection.
+    """
+    if not gstin or not isinstance(gstin, str):
+        return {
+            "gstin": gstin,
+            "is_valid": False,
+            "status": "MISSING_INPUT",
+            "reason": "GSTIN was not provided or is empty.",
+            "is_government_verified": False,
+            "verification_type": "Offline ISO 7064 Mod 36,10 Checksum"
+        }
+
+    clean_gstin = gstin.strip().upper()
+    if not re.match(r"^(0[1-9]|[1-2][0-9]|3[0-8]|97|99)[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$", clean_gstin):
+        return {
+            "gstin": clean_gstin,
+            "is_valid": False,
+            "status": "INVALID_FORMAT",
+            "reason": "GSTIN format violates Indian statutory structure (State: 01-38/97/99, 10-char PAN, 1-char entity, 'Z' default, 1 check char).",
+            "is_government_verified": False,
+            "verification_type": "Offline ISO 7064 Mod 36,10 Checksum"
+        }
+
+    expected_check = compute_gstin_checksum(clean_gstin[:14])
+    actual_check = clean_gstin[14]
+
+    if actual_check != expected_check:
+        return {
+            "gstin": clean_gstin,
+            "is_valid": False,
+            "status": "CHECKSUM_FAILED",
+            "expected_check_digit": expected_check,
+            "actual_check_digit": actual_check,
+            "reason": f"Mathematical checksum failed: check digit is '{actual_check}', expected '{expected_check}' under ISO 7064 Mod 36,10. This is an algorithmic check, not a government portal rejection.",
+            "is_government_verified": False,
+            "verification_type": "Offline ISO 7064 Mod 36,10 Checksum"
+        }
+
+    return {
+        "gstin": clean_gstin,
+        "is_valid": True,
+        "status": "VALID",
+        "expected_check_digit": expected_check,
+        "actual_check_digit": actual_check,
+        "reason": "GSTIN format and ISO 7064 Mod 36,10 checksum mathematically verified.",
+        "is_government_verified": False,
+        "verification_type": "Offline ISO 7064 Mod 36,10 Checksum"
+    }
+
 class DocumentOCRPipeline:
     def __init__(self, languages: List[str] = ['en']):
         print("[INFO] Initializing Vision OCR Engine (EasyOCR on CPU)...")
@@ -55,7 +142,7 @@ class DocumentOCRPipeline:
         - Slot 11: PAN Alpha Suffix
         - Slot 12: Entity Count (usually 1-9)
         - Slot 13: Fixed Statutory Default ('Z')
-        - Slot 14: Check Digit/Letter
+        - Slot 14: Check Digit/Letter (Alphanumeric 0-9, A-Z)
         """
         # 1. State Code -> Digits
         for idx in [0, 1]:
@@ -83,29 +170,33 @@ class DocumentOCRPipeline:
         elif candidate[11] in ['1', 'I']: candidate[11] = 'I'
         elif candidate[11] == '5': candidate[11] = 'S'
 
-        # 5. Entity Code -> Usually digit '1'
-        if candidate[12] in ['I', 'L', 'T', 'l', '|']: candidate[12] = '1'
+        # 5. Entity Code -> Alphanumeric 1-9, A-Z (fix common OCR pipe/l characters)
+        if candidate[12] in ['l', '|']: candidate[12] = '1'
 
-        # 6. Fixed Statutory Slot 13 -> By Indian Law, always 'Z'
-        # Fixes common OCR misreads: 'Γé¼' (Euro), 'C', '2', '7'
-        candidate[13] = 'Z'
+        # 6. Statutory Slot 13 -> Under Indian Law, statutorily 'Z'
+        # Repair common OCR misreads while preventing blind replacement of arbitrary characters
+        if candidate[13] in ['2', '7', 'C', 'c', 'z', '€', 'Γé¼']:
+            candidate[13] = 'Z'
 
-        # 7. Check Code (Slot 14)
-        if candidate[14] == 'S': candidate[14] = '5'
+        # 7. Slot 14 is the check character; preserve valid alphanumeric characters without blind overwrite
 
         return "".join(candidate)
 
-    def find_gstin(self, text: str) -> str | None:
+    def find_gstin(self, text: str, verify_checksum: bool = True) -> str | None:
         """
         Space-agnostic, symbol-mapped sliding window extractor for Indian GSTINs.
         """
         # Step 1: Normalize symbols before alphanumeric stripping
         symbol_map = {
+            '€': 'Z',
             'Γé¼': 'Z',
+            '£': 'E',
             '┬ú': 'E',
             '$': 'S',
             '@': 'A',
+            '©': 'C',
             '┬⌐': 'C',
+            '®': 'R',
             '┬«': 'R'
         }
         for sym, rep in symbol_map.items():
@@ -117,12 +208,25 @@ class DocumentOCRPipeline:
         # Step 3: Slide 15-character window across continuous token stream
         for i in range(len(cleaned) - 14):
             raw_window = list(cleaned[i:i+15])
-            repaired = self.repair_gstin_slot(raw_window)
+            raw_candidate = "".join(raw_window)
+            # Preserve exact extracted value if already valid
+            if is_valid_gstin(raw_candidate, verify_checksum=verify_checksum):
+                return raw_candidate
 
-            # Strict Indian GSTIN validation regex:
-            # State: 01-37 | PAN: 5 Alpha + 4 Digit + 1 Alpha | Entity: 1 Alphanum | Fixed 'Z' | Check Alphanum
-            if re.match(r"^[0-3][0-9][A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}$", repaired):
+            repaired = self.repair_gstin_slot(raw_window)
+            if is_valid_gstin(repaired, verify_checksum=verify_checksum):
                 return repaired
+
+        # Fallback to format-only regex match only when verify_checksum is explicitly False
+        if not verify_checksum:
+            for i in range(len(cleaned) - 14):
+                raw_window = list(cleaned[i:i+15])
+                raw_candidate = "".join(raw_window)
+                if is_valid_gstin(raw_candidate, verify_checksum=False):
+                    return raw_candidate
+                repaired = self.repair_gstin_slot(raw_window)
+                if is_valid_gstin(repaired, verify_checksum=False):
+                    return repaired
 
         return None
 
@@ -157,7 +261,7 @@ class DocumentOCRPipeline:
             extracted_text_blocks.append(page_text)
 
         full_document_text = " ".join(extracted_text_blocks)
-        gstin = self.find_gstin(full_document_text)
+        gstin = self.find_gstin(full_document_text, verify_checksum=True)
         pan = self.derive_pan_from_gstin(gstin)
 
         return {
