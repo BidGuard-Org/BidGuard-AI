@@ -37,9 +37,43 @@ from src.document_classifier import (
 )
 from src.pan_extractor import is_valid_pan, get_pan_entity_type, compare_pan_with_gstin, extract_pan_details, mask_pan, mask_dob, mask_aadhaar
 from src.upload_workflow import DocumentStagingQueue, format_file_size
+from src.report_generator import generate_gem_verification_pdf
 
 # Phase 13 Audit Logger Helper
 AUDIT_LOG_FILE = "audit_ledger.json"
+FASTAPI_BASE_URL = os.getenv("FASTAPI_BASE_URL", "http://localhost:8000")
+
+def check_fastapi_health() -> bool:
+    """Pings FastAPI /health endpoint to verify REST microservice status."""
+    try:
+        import urllib.request
+        req = urllib.request.Request(f"{FASTAPI_BASE_URL}/health", headers={"User-Agent": "BidGuard-Dashboard"})
+        with urllib.request.urlopen(req, timeout=1.5) as resp:
+            if resp.status == 200:
+                data = json.loads(resp.read().decode("utf-8"))
+                return data.get("status") == "ok"
+    except Exception:
+        pass
+    return False
+
+def call_fastapi_predict_risk(feature_dict: dict) -> dict | None:
+    """Delegates ML risk scoring to FastAPI POST /predict-risk."""
+    try:
+        import urllib.request
+        req_data = json.dumps({"features": feature_dict}).encode("utf-8")
+        req = urllib.request.Request(
+            f"{FASTAPI_BASE_URL}/predict-risk",
+            data=req_data,
+            headers={"Content-Type": "application/json", "User-Agent": "BidGuard-Dashboard"}
+        )
+        with urllib.request.urlopen(req, timeout=3.0) as resp:
+            if resp.status == 200:
+                payload = json.loads(resp.read().decode("utf-8"))
+                if payload.get("success"):
+                    return payload.get("prediction")
+    except Exception as e:
+        print(f"[WARN] FastAPI predict-risk request failed: {e}")
+    return None
 
 @st.cache_resource(show_spinner=False)
 def load_ocr_reader():
@@ -65,10 +99,10 @@ def load_risk_ml_models():
 
 risk_model, risk_scaler = load_risk_ml_models()
 
-def predict_bidder_risk(p7_result, p9_result, lineage_records):
+def predict_bidder_risk(p7_result, p9_result, lineage_records, use_fastapi: bool = False):
     """
     Constructs the exact 18-feature vector required by Member 1's trained
-    LogisticRegression model and returns (predicted_class, confidence_score).
+    LogisticRegression model and returns (predicted_class, confidence_score, badge_mode).
     """
     p7_fails = p7_result.get("failure_count", 0)
     inconsistencies = p9_result.get("inconsistency_count", 0)
@@ -92,25 +126,33 @@ def predict_bidder_risk(p7_result, p9_result, lineage_records):
 
     # Exact 18 features required by scaler.feature_names_in_
     features_dict = {
-        'total_requirements': total_reqs,
-        'mandatory_requirements': total_reqs,
-        'compliant_count': compliant,
-        'partially_compliant_count': 0,
-        'non_compliant_count': non_compliant,
-        'insufficient_evidence_count': 0,
-        'compliance_percentage': comp_pct,
-        'missing_document_count': 1 if non_compliant > 0 and inconsistencies > 0 else 0,
-        'expired_document_count': 0,
-        'invalid_document_count': 1 if inconsistencies > 0 else 0,
-        'inconsistency_count': inconsistencies,
-        'mandatory_failure_count': non_compliant,
-        'financial_requirement_failure': fin_fail,
-        'experience_requirement_failure': 0,
-        'registration_requirement_failure': reg_fail,
-        'authorization_requirement_failure': 0,
-        'evidence_confidence_average': avg_conf,
-        'document_quality_score': doc_quality
+        'total_requirements': float(total_reqs),
+        'mandatory_requirements': float(total_reqs),
+        'compliant_count': float(compliant),
+        'partially_compliant_count': 0.0,
+        'non_compliant_count': float(non_compliant),
+        'insufficient_evidence_count': 0.0,
+        'compliance_percentage': float(comp_pct),
+        'missing_document_count': 1.0 if non_compliant > 0 and inconsistencies > 0 else 0.0,
+        'expired_document_count': 0.0,
+        'invalid_document_count': 1.0 if inconsistencies > 0 else 0.0,
+        'inconsistency_count': float(inconsistencies),
+        'mandatory_failure_count': float(non_compliant),
+        'financial_requirement_failure': float(fin_fail),
+        'experience_requirement_failure': 0.0,
+        'registration_requirement_failure': float(reg_fail),
+        'authorization_requirement_failure': 0.0,
+        'evidence_confidence_average': float(avg_conf),
+        'document_quality_score': float(doc_quality)
     }
+
+    if use_fastapi:
+        api_prediction = call_fastapi_predict_risk(features_dict)
+        if api_prediction:
+            pred_class = api_prediction.get("predicted_risk_level", "LOW")
+            probs = api_prediction.get("prediction_probabilities", {})
+            confidence = float(probs.get(pred_class, 0.95))
+            return pred_class, confidence, "FASTAPI"
 
     if risk_model is not None and risk_scaler is not None:
         try:
@@ -460,6 +502,23 @@ st.divider()
 # =====================================================================
 # SIDEBAR CONTROLS (MULTI-DOCUMENT DOSSIER)
 # =====================================================================
+st.sidebar.header("🌐 System Architecture Mode")
+engine_mode = st.sidebar.radio(
+    "Processing Engine",
+    ["Direct In-Process (Standalone)", "FastAPI Microservice (REST Client)"],
+    help="Toggle between direct module execution and decoupled HTTP REST microservice."
+)
+
+use_fastapi_client = False
+if engine_mode == "FastAPI Microservice (REST Client)":
+    if check_fastapi_health():
+        st.sidebar.success(f"🟢 Connected to FastAPI ({FASTAPI_BASE_URL})")
+        use_fastapi_client = True
+    else:
+        st.sidebar.warning(f"🟡 FastAPI offline at {FASTAPI_BASE_URL}. Falling back cleanly to In-Process Engine.")
+        use_fastapi_client = False
+
+st.sidebar.divider()
 st.sidebar.header("\U0001F4CB Tender Specifications (NIT)")
 selected_tender = st.sidebar.selectbox(
     "Active Tender Reference",
@@ -481,15 +540,49 @@ reg_cutoff_date = st.sidebar.date_input(
 
 st.sidebar.divider()
 st.sidebar.header("\U0001F4C1 Vendor Document Dossier")
-upload_mode = st.sidebar.radio(
-    "Data Source Mode",
-    ["Live Multi-Document Upload (Phase 6 Integration)", "Pre-loaded Benchmark Dossiers"]
-)
 
 # Initialize persistent multi-document upload staging queue in session state
 if "staging_queue" not in st.session_state:
     st.session_state["staging_queue"] = DocumentStagingQueue()
 staging_queue: DocumentStagingQueue = st.session_state["staging_queue"]
+
+# -------------------------------------------------------------
+# QUICK DEMO LOADER (Instant Multi-Document Benchmark Dossiers)
+# -------------------------------------------------------------
+st.sidebar.markdown("#### ⚡ Quick Demo Loader")
+st.sidebar.caption("Load complete 4-document dossiers directly into the staging queue:")
+
+def load_demo_dossier_to_staging(set_folder: str, set_label: str):
+    staging_queue.clear()
+    folder_path = os.path.join("demo_dossiers", set_folder)
+    if os.path.exists(folder_path):
+        count = 0
+        for f in sorted(os.listdir(folder_path)):
+            if f.endswith(".pdf"):
+                fpath = os.path.join(folder_path, f)
+                with open(fpath, "rb") as fp:
+                    staging_queue.add_file(f, fp.read())
+                count += 1
+        st.session_state["upload_mode_radio"] = "Live Multi-Document Upload (Phase 6 Integration)"
+        st.sidebar.success(f"⚡ Loaded {count} documents from {set_label}!")
+        st.rerun()
+
+if st.sidebar.button("⚡ Load Compliant Bidder (Set A)", use_container_width=True, help="Loads Set A (Clean Baseline): PAN, GST, Udyam, Audited Balance Sheet. All criteria fully compliant."):
+    load_demo_dossier_to_staging("set_a_compliant", "Set A (Compliant)")
+
+if st.sidebar.button("⚡ Load Discrepancy Bidder (Set B)", use_container_width=True, help="Loads Set B: Contains entity name spelling variation and turnover variance (~4.11%)."):
+    load_demo_dossier_to_staging("set_b_discrepancy", "Set B (Discrepancy)")
+
+if st.sidebar.button("⚡ Load Fraudulent Bidder (Set C)", use_container_width=True, help="Loads Set C: Contains fraudulent PAN mismatch in GSTIN and 60% turnover variance."):
+    load_demo_dossier_to_staging("set_c_fraudulent", "Set C (Fraudulent)")
+
+st.sidebar.markdown("---")
+
+upload_mode = st.sidebar.radio(
+    "Data Source Mode",
+    ["Live Multi-Document Upload (Phase 6 Integration)", "Pre-loaded Benchmark Dossiers"],
+    key="upload_mode_radio"
+)
 
 bidder_selection = None
 current_lineage = []
@@ -581,11 +674,20 @@ if upload_mode == "Live Multi-Document Upload (Phase 6 Integration)":
         doc_date = slots["doc_date"]
         bidder_id = f"BID-{uuid.uuid4().hex[:5].upper()}"
 
-        # Execute Member 1 Predictive ML Risk Classifier
-        pred_risk, risk_prob, is_ml = predict_bidder_risk(res["p7_result"], res["p9_result"], current_lineage)
-        badge_type = "\U0001F916 ML Model" if is_ml else "Deterministic"
+        # Execute Predictive ML Risk Classifier
+        pred_risk, risk_prob, is_ml = predict_bidder_risk(
+            res["p7_result"], res["p9_result"], current_lineage, use_fastapi=use_fastapi_client
+        )
+        if is_ml == "FASTAPI":
+            badge_type = "🌐 FastAPI REST Client"
+            risk_badge = f"{risk_prob*100:.1f}% (FastAPI Microservice)"
+        elif is_ml is True:
+            badge_type = "\U0001F916 In-Process ML Model"
+            risk_badge = f"{risk_prob*100:.1f}% (ML Model)"
+        else:
+            badge_type = "Deterministic"
+            risk_badge = f"{risk_prob*100:.1f}% (Deterministic)"
         risk_rating = pred_risk
-        risk_badge = f"{risk_prob*100:.1f}% (ML Model)"
     else:
         st.info("👈 Please upload vendor documents (GST Certificate, PAN Card, Balance Sheet, etc.) in the sidebar to begin.")
         st.stop()
@@ -639,8 +741,18 @@ elif upload_mode == "Pre-loaded Benchmark Dossiers":
     }
 
     # Execute actual ML Model inference for benchmark dossiers
-    pred_risk, risk_prob, is_ml = predict_bidder_risk(benchmark_p7, benchmark_p9, current_lineage)
-    badge_type = "\U0001F916 ML Model" if is_ml else "Deterministic"
+    pred_risk, risk_prob, is_ml = predict_bidder_risk(
+        benchmark_p7, benchmark_p9, current_lineage, use_fastapi=use_fastapi_client
+    )
+    if is_ml == "FASTAPI":
+        badge_type = "🌐 FastAPI REST Client"
+        risk_badge = f"{risk_prob*100:.1f}% (FastAPI Microservice)"
+    elif is_ml is True:
+        badge_type = "\U0001F916 In-Process ML Model"
+        risk_badge = f"{risk_prob*100:.1f}% (ML Model)"
+    else:
+        badge_type = "Deterministic"
+        risk_badge = f"{risk_prob*100:.1f}% (Deterministic)"
     risk_rating = f"{pred_risk} RISK ({risk_prob*100:.1f}%)"
     risk_badge = f"{risk_prob*100:.1f}% ({'ML Model' if is_ml else 'Deterministic'})"
 
@@ -773,6 +885,36 @@ with col_right:
         )
         st.error(f"Submission rejected under statutory rules. Event ID: {evt_id}")
         st.rerun()
+
+    st.markdown("---")
+    # Download GeM Verification Report (PDF)
+    try:
+        report_pdf = generate_gem_verification_pdf(
+            tender_id=selected_tender,
+            bidder_id=bidder_id,
+            company_name=company_name,
+            gstin_no=gstin_no,
+            pan_no=masked_pan or pan_no,
+            pan_entity_type=pan_entity_type,
+            turnover_gst=gst_turnover_val,
+            turnover_bs=bs_turnover_val,
+            compliance_status=compliance_status,
+            risk_rating=risk_rating,
+            risk_badge=risk_badge,
+            inconsistencies_count=inconsistencies_count,
+            audit_data=audit_data,
+            officer_remarks=officer_remarks
+        )
+        st.download_button(
+            label="\U0001F4C4 Download GeM Verification Report (PDF)",
+            data=report_pdf,
+            file_name=f"GeM_Verification_Report_{bidder_id}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+            help="Exports official single-page GeM Statutory Compliance & Forensic Verification Summary PDF."
+        )
+    except Exception as e:
+        st.warning(f"Could not generate GeM PDF Report: {e}")
 
 # =====================================================================
 # HISTORICAL AUDIT LEDGER (PHASE 13)

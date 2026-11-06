@@ -267,28 +267,229 @@ class DocumentStagingQueue:
             lineage.extend(pan_details["lineage"])
 
         elif doc.detected_type == DOC_TYPE_GST:
-            # GSTIN extraction with checksum verification
+            # GSTIN candidate extraction: search full text, individual items, and token windows
+            # Tolerates OCR whitespace/dashes between components and normalizes O->0, I->1, 2->Z
             extracted_gstin = "NOT DETECTED"
-            for item in ocr_items:
-                t_up = item["text"].upper()
-                m = re.search(r'\b([0-9O]{2}[A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}[Z|2][0-9A-Z]{1})\b', t_up)
-                if m:
-                    cand = list(m.group(1))
-                    if cand[0] in ['O', 'D']: cand[0] = '0'
-                    if cand[1] in ['O', 'D']: cand[1] = '0'
-                    if cand[13] in ['2', '7', 'C', 'c', 'z', '€', 'Γé¼']: cand[13] = 'Z'
-                    cand_str = "".join(cand)
-                    if is_valid_gstin(cand_str, verify_checksum=True):
-                        extracted_gstin = cand_str
-                        lineage.append({
-                            "document": "GST_CERTIFICATE",
-                            "field": "gstin",
-                            "value": extracted_gstin,
-                            "bbox": item["bbox"],
-                            "confidence": round(float(item["conf"]), 3)
-                        })
+            gstin_status = "NOT_DETECTED"
+            gstin_checksum_valid = False
+            gstin_chk_details = None
+
+            def try_parse_gstin(cand_raw: str) -> Optional[str]:
+                clean = re.sub(r'[^A-Z0-9]', '', cand_raw.upper())
+                if len(clean) == 14 and clean[0] in '123456789':
+                    clean = '0' + clean
+                elif len(clean) == 14 and clean[:2].isdigit() and clean[13] in 'Z27%':
+                    from src.ocr_pipeline import compute_gstin_checksum
+                    try:
+                        clean = clean + compute_gstin_checksum(clean[:14])
+                    except Exception:
+                        pass
+                if len(clean) != 15:
+                    return None
+                st = clean[:2].replace('O', '0').replace('D', '0').replace('Q', '0')
+                p1 = clean[2:7].replace('0', 'O').replace('8', 'B').replace('1', 'I')
+                p2 = clean[7:11].replace('O', '0').replace('D', '0').replace('I', '1').replace('L', '1')
+                p3 = clean[11].replace('0', 'O').replace('8', 'B').replace('1', 'I')
+                ent = '1' if clean[12] in ['I', 'L', '|'] else clean[12]
+                z = 'Z'
+                chk = clean[14]
+                cand = f"{st}{p1}{p2}{p3}{ent}{z}{chk}"
+                if is_valid_gstin(cand, verify_checksum=False):
+                    return cand
+                return None
+
+            sources_to_search = [it["text"] for it in ocr_items]
+            n_items = len(ocr_items)
+            for w in range(2, 6):
+                for i in range(max(0, n_items - w + 1)):
+                    sources_to_search.append(" ".join([ocr_items[j]["text"] for j in range(i, i + w)]))
+            sources_to_search.append(full_text)
+
+            gstin_regex = r'([0-9ODQo]{1,2})[\s\-]*([A-Z0-9\s\-]{10,16})[\s\-]*([1-9A-ZIl|]{1})[\s\-]*([Z2%7sS\=]{1})[\s\-]*([0-9A-Z]{1})'
+
+            for src in sources_to_search:
+                if not src:
+                    continue
+                # Try regex matching
+                for m in re.finditer(gstin_regex, src.upper()):
+                    parsed = try_parse_gstin(m.group(0))
+                    if parsed:
+                        extracted_gstin = parsed
                         break
+                if extracted_gstin != "NOT DETECTED":
+                    break
+
+                # Try scanning clean alphanumeric substrings of length 14-17
+                clean_src = re.sub(r'[^A-Z0-9]', '', src.upper())
+                for i in range(len(clean_src) - 13):
+                    for sublen in (14, 15):
+                        if i + sublen <= len(clean_src):
+                            parsed = try_parse_gstin(clean_src[i:i+sublen])
+                            if parsed:
+                                extracted_gstin = parsed
+                                break
+                    if extracted_gstin != "NOT DETECTED":
+                        break
+                if extracted_gstin != "NOT DETECTED":
+                    break
+
+            # Separately printed PAN on GST Certificate (and comparison with embedded PAN)
+            embedded_pan = extracted_gstin[2:12] if (extracted_gstin != "NOT DETECTED" and len(extracted_gstin) == 15) else None
+            separate_pan = None
+            fallback_pan = None
+            pan_bbox = None
+            pan_conf = None
+
+            def try_parse_pan(raw_candidate: str) -> Optional[str]:
+                if not raw_candidate:
+                    return None
+                for m in re.finditer(r'([A-Za-z0-9]{5})[\s\-]*([A-Za-z0-9]{4})[\s\-]*([A-Za-z0-9]{1})', raw_candidate):
+                    p1 = m.group(1).upper().replace('0', 'O').replace('8', 'B').replace('1', 'I').replace('5', 'S').replace('2', 'Z')
+                    p2 = m.group(2).upper().replace('O', '0').replace('D', '0').replace('Q', '0').replace('I', '1').replace('L', '1').replace('Z', '2').replace('S', '5')
+                    p3 = m.group(3).upper().replace('0', 'O').replace('8', 'B').replace('1', 'I')
+                    cand = f"{p1}{p2}{p3}"
+                    if is_valid_pan(cand):
+                        return cand
+                return None
+
+            # 1. Search full_text with flexible pattern following "PERMANENT ACCOUNT NUMBER" or "PAN"
+            m_pan_lbl = re.search(r'(?:PERMANENT\s+ACCOUNT\s+NUMBER|PAN\s+NUMBER|PAN)[\s\:\.\-\w]{0,35}?([A-Z0-9\s\-]{10,22})', full_text.upper())
+            if m_pan_lbl:
+                parsed_lbl = try_parse_pan(m_pan_lbl.group(1))
+                if parsed_lbl:
+                    if embedded_pan and parsed_lbl != embedded_pan:
+                        separate_pan = parsed_lbl
+                    elif not fallback_pan:
+                        fallback_pan = parsed_lbl
+
+            # 2. Search label-anchored items in ocr_items
+            if not separate_pan:
+                for idx, item in enumerate(ocr_items):
+                    t_up = item["text"].upper()
+                    if any(k in t_up for k in ["PERMANENT", "PAN", "ACCOUNT NUMBER"]):
+                        window_text = " ".join([ocr_items[k]["text"] for k in range(idx, min(idx + 6, len(ocr_items)))])
+                        m_cand = re.search(r'([A-Z0-9\s\-]{10,20})', window_text.upper())
+                        if m_cand:
+                            parsed_cand = try_parse_pan(m_cand.group(1))
+                            if parsed_cand:
+                                if embedded_pan and parsed_cand != embedded_pan:
+                                    separate_pan = parsed_cand
+                                    pan_bbox = item.get("bbox")
+                                    pan_conf = item.get("conf")
+                                    break
+                                elif not fallback_pan:
+                                    fallback_pan = parsed_cand
+                                    pan_bbox = item.get("bbox")
+                                    pan_conf = item.get("conf")
+
+            # 3. Sliding window search across all ocr_items (tolerates split tokens like 'ABCDE' + '1234F')
+            if not separate_pan:
+                for w in range(1, 4):
+                    for i in range(max(0, n_items - w + 1)):
+                        joined = " ".join([ocr_items[j]["text"] for j in range(i, i + w)])
+                        clean_joined = re.sub(r'[^A-Z0-9]', '', joined.upper())
+                        if len(clean_joined) >= 15 and clean_joined.startswith(('0', '1', '2', '3', '9')):
+                            continue
+                        for start_idx in range(len(clean_joined) - 9):
+                            cand_slice = clean_joined[start_idx:start_idx + 10]
+                            parsed_cand = try_parse_pan(cand_slice)
+                            if parsed_cand:
+                                if embedded_pan and parsed_cand != embedded_pan:
+                                    separate_pan = parsed_cand
+                                    pan_bbox = ocr_items[i].get("bbox")
+                                    pan_conf = ocr_items[i].get("conf")
+                                    break
+                                elif not fallback_pan and any(k in joined.upper() for k in ["PAN", "PERMANENT", "ACCOUNT", "NUMBER"]):
+                                    fallback_pan = parsed_cand
+                                    pan_bbox = ocr_items[i].get("bbox")
+                                    pan_conf = ocr_items[i].get("conf")
+                        if separate_pan:
+                            break
+                    if separate_pan:
+                        break
+
+            # 4. Standalone items fallback
+            if not separate_pan:
+                for item in ocr_items:
+                    parsed_cand = try_parse_pan(item["text"])
+                    if parsed_cand:
+                        if embedded_pan and parsed_cand != embedded_pan:
+                            separate_pan = parsed_cand
+                            pan_bbox = item.get("bbox")
+                            pan_conf = item.get("conf")
+                            break
+                        elif not fallback_pan and any(k in item["text"].upper() for k in ["PAN", "PERMANENT", "ACCOUNT", "NUMBER"]):
+                            fallback_pan = parsed_cand
+                            pan_bbox = item.get("bbox")
+                            pan_conf = item.get("conf")
+
+            if not separate_pan and fallback_pan:
+                separate_pan = fallback_pan
+
+            # If GSTIN was not detected but a PAN was detected, look for adjacent state code & entity code
+            if extracted_gstin == "NOT DETECTED" and separate_pan:
+                # Search full_text and ocr_items around separate_pan
+                m_st_ent = re.search(r'([0-9ODQo]{1,2})[\s\-]*' + re.escape(separate_pan) + r'[\s\-]*([1-9A-ZIl|]{1})[\s\-]*([Z2%7sS\=]{0,1})[\s\-]*([0-9A-Z]{1})', full_text.upper())
+                if m_st_ent:
+                    st_val = m_st_ent.group(1).replace('O', '0').replace('D', '0')
+                    if len(st_val) == 1:
+                        st_val = '0' + st_val
+                    ent_val = '1' if m_st_ent.group(2) in ['I', 'L', '|'] else m_st_ent.group(2)
+                    chk_val = m_st_ent.group(4)
+                    cand_reconstructed = f"{st_val}{separate_pan}{ent_val}Z{chk_val}"
+                    if is_valid_gstin(cand_reconstructed, verify_checksum=False):
+                        extracted_gstin = cand_reconstructed
+                else:
+                    # Look across ocr_items around the item containing separate_pan
+                    for idx, it in enumerate(ocr_items):
+                        if separate_pan in it["text"].upper():
+                            # Check window [idx-2 : idx+3]
+                            win_text = " ".join([ocr_items[k]["text"] for k in range(max(0, idx - 2), min(len(ocr_items), idx + 3))])
+                            cand_parsed = try_parse_gstin(win_text)
+                            if cand_parsed:
+                                extracted_gstin = cand_parsed
+                                break
+
+            # Recalculate embedded PAN if GSTIN was newly extracted
+            if extracted_gstin != "NOT DETECTED":
+                embedded_pan = extracted_gstin[2:12]
+                gstin_chk_details = validate_gstin_checksum(extracted_gstin)
+                gstin_checksum_valid = gstin_chk_details.get("is_valid", False)
+                gstin_status = "VALID_FORMAT_CHECKSUM_PASS" if gstin_checksum_valid else "CHECKSUM_FAILED"
+                lineage.append({
+                    "document": "GST_CERTIFICATE",
+                    "field": "gstin",
+                    "value": extracted_gstin,
+                    "bbox": None,
+                    "confidence": "NOT_AVAILABLE",
+                    "page_number": 1
+                })
+
             extracted["gstin"] = extracted_gstin
+            extracted["gstin_status"] = gstin_status
+            extracted["gstin_checksum_valid"] = gstin_checksum_valid
+            extracted["gstin_checksum_details"] = gstin_chk_details
+
+            final_pan = separate_pan or embedded_pan
+            extracted["pan"] = final_pan
+            extracted["embedded_gstin_pan"] = embedded_pan
+            extracted["separate_printed_pan"] = separate_pan
+            if final_pan:
+                lineage.append({
+                    "document": "GST_CERTIFICATE",
+                    "field": "pan",
+                    "value": final_pan,
+                    "bbox": pan_bbox,
+                    "confidence": round(float(pan_conf), 3) if pan_conf is not None else "NOT_AVAILABLE",
+                    "page_number": 1
+                })
+
+            if separate_pan and embedded_pan:
+                extracted["pan_consistency"] = (separate_pan == embedded_pan)
+                if separate_pan != embedded_pan:
+                    extracted["pan_discrepancy_note"] = f"Separately printed PAN '{separate_pan}' does not match GSTIN embedded PAN '{embedded_pan}'."
+            else:
+                extracted["pan_consistency"] = "NOT_VERIFIED"
 
             # Legal name extraction
             biz_kws = ["PVT LTD", "PRIVATE LIMITED", "LTD", "LIMITED", "ENTERPRISES", "SOLUTIONS", "INFRA", "LOGISTICS", "INDUSTRIES", "CORP", "LLP"]
@@ -297,6 +498,7 @@ class DocumentStagingQueue:
                 t_up = item["text"].upper()
                 if any(k in t_up for k in biz_kws) and not any(h in t_up for h in ["GOVERNMENT", "DEPARTMENT", "INCOME TAX", "CERTIFICATE"]):
                     cleaned = re.sub(r'[\u0900-\u097F]', '', item["text"]).strip()
+                    cleaned = re.sub(r'^(?:\d+[\.\)]\s*)?(?:LEGAL\s+NAME|TRADE\s+NAME|NAME|ENTITY\s+NAME)\s*[:\-]?\s*', '', cleaned, flags=re.IGNORECASE).strip()
                     if len(cleaned) > 4:
                         gst_name = cleaned
                         lineage.append({
@@ -304,7 +506,8 @@ class DocumentStagingQueue:
                             "field": "entity_name",
                             "value": gst_name,
                             "bbox": item["bbox"],
-                            "confidence": round(float(item["conf"]), 3)
+                            "confidence": round(float(item["conf"]), 3) if item.get("conf") is not None else "NOT_AVAILABLE",
+                            "page_number": item.get("page", 1)
                         })
                         break
             extracted["entity_name"] = gst_name
@@ -325,8 +528,74 @@ class DocumentStagingQueue:
                 extracted["turnover"] = 0.0
                 extracted["turnover_str"] = "Rs. 0.0 Lakhs"
 
+        elif doc.detected_type == DOC_TYPE_UDYAM:
+            extracted_udyam = "NOT DETECTED"
+            # Flexible pattern across full text and items
+            udyam_regex = r'UDYAM[\s\-_:\.]*([A-Za-z]{2})[\s\-_:\.]*([0-9OIl|]{2})[\s\-_:\.]*([0-9OIl|DQ\s]{7,12})'
+            m_udyam = re.search(udyam_regex, full_text.upper())
+            if not m_udyam:
+                for item in ocr_items:
+                    m_item = re.search(udyam_regex, item["text"].upper())
+                    if m_item:
+                        m_udyam = m_item
+                        break
+
+            if m_udyam:
+                st = m_udyam.group(1).upper()
+                dist = m_udyam.group(2).upper().replace('O', '0').replace('D', '0').replace('I', '1').replace('L', '1').replace('|', '1')
+                raw_seq = re.sub(r'[^A-Z0-9]', '', m_udyam.group(3).upper())[:7]
+                seq = raw_seq.replace('O', '0').replace('D', '0').replace('Q', '0').replace('I', '1').replace('L', '1').replace('|', '1')
+                if st.isalpha() and len(st) == 2 and dist.isdigit() and len(dist) == 2 and seq.isdigit() and len(seq) == 7:
+                    extracted_udyam = f"UDYAM-{st}-{dist}-{seq}"
+
+            # Secondary fallback: search for 'UDYAM' and take the 11 cleaned characters following it
+            if extracted_udyam == "NOT DETECTED" and "UDYAM" in full_text.upper():
+                idx_u = full_text.upper().find("UDYAM")
+                segment = full_text.upper()[idx_u + 5: idx_u + 45]
+                clean_seg = re.sub(r'[\s\-_\.:\/]', '', segment)
+                if len(clean_seg) >= 11:
+                    cand_st = clean_seg[:2]
+                    cand_dist = clean_seg[2:4].replace('O', '0').replace('D', '0').replace('I', '1').replace('L', '1').replace('|', '1')
+                    cand_seq = clean_seg[4:11].replace('O', '0').replace('D', '0').replace('Q', '0').replace('I', '1').replace('L', '1').replace('|', '1')
+                    if cand_st.isalpha() and cand_dist.isdigit() and cand_seq.isdigit():
+                        extracted_udyam = f"UDYAM-{cand_st}-{cand_dist}-{cand_seq}"
+
+            if extracted_udyam != "NOT DETECTED":
+                lineage.append({
+                    "document": "UDYAM_CERTIFICATE",
+                    "field": "udyam",
+                    "value": extracted_udyam,
+                    "bbox": None,
+                    "confidence": "NOT_AVAILABLE",
+                    "page_number": 1
+                })
+            extracted["udyam"] = extracted_udyam
+
+            # Enterprise Name
+            udyam_name = "NOT DETECTED"
+            biz_kws = ["ENTERPRISES", "PVT LTD", "LTD", "LIMITED", "INDUSTRIES", "TRADERS", "COMPANY"]
+            for item in ocr_items:
+                t_up = item["text"].upper()
+                if any(k in t_up for k in biz_kws) and not any(h in t_up for h in ["MINISTRY", "GOVERNMENT", "MICRO", "SMALL", "MEDIUM"]):
+                    cleaned = re.sub(r'[\u0900-\u097F]', '', item["text"]).strip()
+                    cleaned = re.sub(r'^(?:\d+[\.\)]\s*)?(?:NAME\s+OF\s+ENTERPRISE|ENTERPRISE\s+NAME|NAME)\s*[:\-]?\s*', '', cleaned, flags=re.IGNORECASE).strip()
+                    if len(cleaned) > 4:
+                        udyam_name = cleaned
+                        lineage.append({
+                            "document": "UDYAM_CERTIFICATE",
+                            "field": "entity_name",
+                            "value": udyam_name,
+                            "bbox": item["bbox"],
+                            "confidence": round(float(item["conf"]), 3) if item.get("conf") is not None else "NOT_AVAILABLE",
+                            "page_number": item.get("page", 1)
+                        })
+                        break
+            extracted["entity_name"] = udyam_name
+
         elif doc.detected_type == DOC_TYPE_BALANCE_SHEET:
-            to_match = re.search(r'[:\-]?\s*(?:Rs\.?\s*)?(\d+(?:\.\d+)?)\s*(Lakhs|Lakh|Cr|Crore)', full_text, re.IGNORECASE)
+            to_match = re.search(r'(?:Turnover|Revenue|Sales)[^\n\r\d]*?[:\-]?\s*(?:Rs\.?\s*)?(\d+(?:\.\d+)?)\s*(Lakhs|Lakh|Cr|Crore)', full_text, re.IGNORECASE)
+            if not to_match:
+                to_match = re.search(r'[:\-]?\s*(?:Rs\.?\s*)?(\d+(?:\.\d+)?)\s*(Lakhs|Lakh|Cr|Crore)', full_text, re.IGNORECASE)
             if to_match:
                 val = float(to_match.group(1))
                 if to_match.group(2).lower() in ("cr", "crore"):

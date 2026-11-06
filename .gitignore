@@ -30,6 +30,15 @@ models/*.pth
 temp_uploads/
 .streamlit/secrets.toml
 
+# Local Real-World Testing Dataset & Reports (Zero PII in Git)
+local_eval/data/
+local_eval/ground_truth.json
+local_eval/reports/
+eval_data/
+eval_reports/
+*.eval_report.json
+*.eval_report.md
+
 # Generated audit logs
 audit_ledger.json
 
@@ -44,3 +53,7 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+# Synthetic Demonstration Dossiers (Whitelisted for SIH live presentation)
+!demo_dossiers/
+

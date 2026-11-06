@@ -28,9 +28,9 @@ ALL_DOCUMENT_TYPES = [
 
 # Structural Regex Patterns
 PAN_REGEX = r"\b[A-Z]{5}[0-9]{4}[A-Z]{1}\b"
-AADHAAR_REGEX = r"\b[2-9]{1}[0-9]{3}\s[0-9]{4}\s[0-9]{4}\b"
+AADHAAR_REGEX = r"\b[2-9]{1}[0-9]{3}[\s\-]?[0-9]{4}[\s\-]?[0-9]{4}\b|\b[X\d]{4}[\s\-][X\d]{4}[\s\-]\d{4}\b"
 GSTIN_REGEX = r"\b[0-3][0-9][A-Z]{5}[0-9]{4}[A-Z]{1}[1-9A-Z]{1}Z[0-9A-Z]{1}\b"
-UDYAM_REGEX = r"\bUDYAM-[A-Z]{2}-[0-9]{2}-[0-9]{7}\b"
+UDYAM_REGEX = r"\bUDYAM[\s\-_]+[A-Z]{2}[\s\-_]+[0-9O]{2}[\s\-_]+[0-9O]{7}\b"
 ITR_ACK_REGEX = r"\b[0-9]{15}\b"
 
 # Weighted Keyphrases for Document Classification (English & Hindi/Bilingual)
@@ -43,9 +43,7 @@ CLASSIFICATION_RULES = {
             "PERMANENT ACCOUNT NUMBER CARD",
             "स्थायी लेखा संख्या कार्ड",
             "स्थायी लेखा संख्या",
-            "GOVT. OF INDIA",
-            "GOVERNMENT OF INDIA",
-            "भारत सरकार"
+            "AYAKAR VIBHAG"
         ],
         "keywords": [
             "PAN",
@@ -72,19 +70,30 @@ CLASSIFICATION_RULES = {
             "MERA AADHAAR",
             "UIDAI",
             "AADHAAR",
+            "AADHAR",
             "आधार",
+            "आम आदमी का अधिकार",
+            "AAM AADMI KA ADHIKAR",
             "ENROLMENT NO"
         ],
         "keywords": [
             "VID",
             "HELP@UIDAI.GOV.IN",
             "WWW.UIDAI.GOV.IN",
+            "1947",
             "YEAR OF BIRTH",
             "जन्म वर्ष",
+            "GENDER",
             "MALE",
             "FEMALE",
             "पुरुष",
-            "महिला"
+            "महिला",
+            "S/O",
+            "D/O",
+            "W/O",
+            "C/O",
+            "पता",
+            "ADDRESS"
         ],
         "regex": AADHAAR_REGEX,
         "weight_strong": 5.0,
@@ -247,16 +256,24 @@ def classify_document_text(text: str) -> Dict[str, Any]:
     # -------------------------------------------------------------
     # 1. Strict Aadhaar Isolation:
     # Aadhaar must NEVER be classified as PAN merely because it has personal details or ID numbers.
-    has_aadhaar_markers = (
-        scores[DOC_TYPE_AADHAAR] >= 4.0 or
-        re.search(AADHAAR_REGEX, upper_text) is not None or
-        "UIDAI" in upper_text or
-        "MERA AADHAAR" in upper_text or
-        "आधार" in text
+    has_pan_statutory_markers = (
+        any(p in upper_text for p in ["INCOME TAX", "आयकर", "PERMANENT ACCOUNT NUMBER", "स्थायी लेखा"]) or
+        (re.search(PAN_REGEX, upper_text) is not None and not any(a in upper_text for a in ["UIDAI", "AADHAAR", "AADHAR", "आधार"]))
     )
-    if has_aadhaar_markers:
-        scores[DOC_TYPE_AADHAAR] += 6.0
-        scores[DOC_TYPE_PAN] = max(0.0, scores[DOC_TYPE_PAN] - 6.0)
+
+    has_aadhaar_markers = (
+        scores[DOC_TYPE_AADHAAR] >= 2.0 or
+        re.search(AADHAAR_REGEX, upper_text) is not None or
+        any(k in upper_text for k in ["UIDAI", "AADHAAR", "AADHAR", "MERA AADHAAR", "आम आदमी का अधिकार", "VID:"]) or
+        "आधार" in text or
+        (any(g in upper_text for g in ["MALE", "FEMALE", "पुरुष", "महिला", "S/O", "D/O", "W/O"]) and not has_pan_statutory_markers)
+    )
+    if has_aadhaar_markers and not has_pan_statutory_markers:
+        scores[DOC_TYPE_AADHAAR] += 7.0
+        scores[DOC_TYPE_PAN] = 0.0
+    elif has_aadhaar_markers:
+        scores[DOC_TYPE_AADHAAR] += 4.0
+        scores[DOC_TYPE_PAN] = max(0.0, scores[DOC_TYPE_PAN] - 5.0)
 
     # 2. GSTIN Disambiguation:
     # If a 15-char GSTIN and GST headers are present, classify as GST Certificate

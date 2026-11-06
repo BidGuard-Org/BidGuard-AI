@@ -32,10 +32,37 @@ def test_turnover_mismatch_detected_when_balance_sheet_provided(consistency_engi
     assert report["inconsistency_count"] == 1
 
 def test_pan_mismatch_in_gstin(consistency_engine):
-    """When standalone PAN does not match embedded PAN in GSTIN, an inconsistency is flagged."""
+    """When standalone PAN does not match embedded PAN in GSTIN, a structured CRITICAL inconsistency is flagged."""
     res = consistency_engine.check_pan_in_gstin("BBBBB9999B", "07AAAAA0000A1Z5")
     assert res["status"] == "FAIL"
     assert res["passed"] is False
+    assert res["flag"] == "PAN_MISMATCH_IN_GSTIN"
+    assert res["severity"] == "CRITICAL"
+    assert res["discrepancy_detected"] is True
+    assert "CRITICAL FORENSIC MISMATCH" in res["reason"]
+
+    # When matching, verify benign status
+    match_res = consistency_engine.check_pan_in_gstin("AAAAA0000A", "07AAAAA0000A1Z5")
+    assert match_res["status"] == "PASS"
+    assert match_res["passed"] is True
+    assert match_res["flag"] == "PAN_MATCH_VERIFIED"
+    assert match_res["severity"] == "NONE"
+    assert match_res["discrepancy_detected"] is False
+
+def test_structured_discrepancy_collection(consistency_engine):
+    """evaluate_dossier_consistency collects structured discrepancies and counts critical ones."""
+    dossier = {
+        "pan_card": {"pan_number": "BBBBB9999B", "legal_name": "APEX INFOTECH PVT LTD"},
+        "gst_certificate": {"gstin": "07AAAAA0000A1Z5", "legal_name": "APEX INFOTECH PVT LTD", "annual_turnover": 100.0},
+        "balance_sheet": {"audited_turnover": 40.0}
+    }
+    report = consistency_engine.evaluate_dossier_consistency(dossier)
+    assert report["is_fully_consistent"] is False
+    assert report["inconsistency_count"] == 2
+    assert report["critical_discrepancy_count"] == 1
+    flags = [d["flag"] for d in report["discrepancies"]]
+    assert "PAN_MISMATCH_IN_GSTIN" in flags
+    assert "TURNOVER_VARIANCE_EXCEEDED" in flags
 
 def test_entity_name_mismatch(consistency_engine):
     """When entity legal names mismatch, check fails."""

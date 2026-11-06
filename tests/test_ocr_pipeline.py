@@ -78,6 +78,21 @@ def test_slot_14_preserves_check_digit_s(ocr_pipeline):
     repaired = ocr_pipeline.repair_gstin_slot(cand)
     assert repaired[14] == "S"
 
+def test_repair_gstin_with_checksum_permutations(ocr_pipeline):
+    """Tier 1 & Tier 2 confusable repair resolves low-DPI scan confusions."""
+    # 27AAACA0006A1Z has check digit 'S'. Candidate has '5' (common OCR confusion for S)
+    repaired = ocr_pipeline.repair_gstin_with_checksum_permutations("27AAACA0006A1Z5")
+    assert repaired == "27AAACA0006A1ZS"
+    assert is_valid_gstin(repaired, verify_checksum=True) is True
+
+    # Check that already valid GSTIN passes through unchanged
+    assert ocr_pipeline.repair_gstin_with_checksum_permutations("27AAACA0006A1ZS") == "27AAACA0006A1ZS"
+
+    # Non-destructive fallback returns structurally valid string even if checksum cannot be matched
+    fallback = ocr_pipeline.repair_gstin_with_checksum_permutations("07AAAAA0000A1Z5")
+    assert fallback == "07AAAAA0000A1Z5"
+    assert is_valid_gstin(fallback, verify_checksum=False) is True
+
 def test_find_gstin_preserves_exact_extracted_value(ocr_pipeline):
     """find_gstin extracts valid GSTIN verbatim without silent modifications."""
     sample_text = "INVOICE TAX REGISTRATION GSTIN: 27AAPFU0939F1ZV DATE: 12/04/2024"

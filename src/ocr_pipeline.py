@@ -7,6 +7,27 @@ from typing import Dict, Any, List
 
 CHARS = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
+CONFUSABLE_MAP: Dict[str, List[str]] = {
+    '0': ['O', 'D', 'Q'],
+    'O': ['0', 'Q', 'D'],
+    'D': ['0', 'O', 'Q'],
+    'Q': ['0', 'O', 'D'],
+    '1': ['I', 'L', 'T', '|'],
+    'I': ['1', 'L', 'T', '|'],
+    'L': ['1', 'I', '|'],
+    'T': ['1', 'I'],
+    '|': ['1', 'I', 'L'],
+    '2': ['Z', '7'],
+    'Z': ['2', '7'],
+    '7': ['Z', '2', '1'],
+    '5': ['S'],
+    'S': ['5'],
+    '8': ['B', '6'],
+    'B': ['8', '6'],
+    '6': ['G', 'B', '8'],
+    'G': ['6', 'B'],
+}
+
 def compute_gstin_checksum(gstin14: str) -> str:
     """Calculates ISO 7064 Mod 36,10 (Luhn Mod 36) check digit for Indian GSTIN."""
     total = 0
@@ -182,6 +203,77 @@ class DocumentOCRPipeline:
 
         return "".join(candidate)
 
+    def repair_gstin_with_checksum_permutations(self, raw_candidate: str) -> str | None:
+        """
+        Multi-pass mathematical repair for low-DPI OCR scans.
+        Explores confusable character permutations constrained by ISO 7064 Mod 36,10.
+        """
+        if not raw_candidate or not isinstance(raw_candidate, str):
+            return None
+
+        clean_raw = re.sub(r"[^A-Za-z0-9]", "", raw_candidate).upper()
+        if len(clean_raw) != 15:
+            return None
+
+        # 1. Check if the string already passes is_valid_gstin(..., verify_checksum=True)
+        if is_valid_gstin(clean_raw, verify_checksum=True):
+            return clean_raw
+
+        # Run standard structural slot repair
+        cand = list(self.repair_gstin_slot(list(clean_raw)))
+        if len(cand) != 15:
+            return None
+        cand_str = "".join(cand)
+        if is_valid_gstin(cand_str, verify_checksum=True):
+            return cand_str
+
+        # 2. Tier 1: Check-digit confusable resolution on slot 14 against compute_gstin_checksum(cand[:14])
+        try:
+            expected_chk = compute_gstin_checksum("".join(cand[:14]))
+            actual_chk = cand[14]
+            if actual_chk == expected_chk or actual_chk in CONFUSABLE_MAP.get(expected_chk, []):
+                tier1_cand = "".join(cand[:14]) + expected_chk
+                if is_valid_gstin(tier1_cand, verify_checksum=True):
+                    return tier1_cand
+        except Exception:
+            pass
+
+        # 3. Tier 2: Single-position confusable substitution on cand[:14] that yields a valid ISO 7064 Mod 36,10 checksum
+        base14 = list(cand[:14])
+        for idx in range(14):
+            curr_char = base14[idx]
+            alternatives = CONFUSABLE_MAP.get(curr_char, [])
+            for alt in alternatives:
+                # Slot syntax constraints
+                if idx in (0, 1) and not alt.isdigit():
+                    continue
+                if 2 <= idx <= 6 and not alt.isalpha():
+                    continue
+                if 7 <= idx <= 10 and not alt.isdigit():
+                    continue
+                if idx == 11 and not alt.isalpha():
+                    continue
+                if idx == 13 and alt != 'Z':
+                    continue
+
+                trial = list(base14)
+                trial[idx] = alt
+                trial_prefix = "".join(trial)
+                try:
+                    chk = compute_gstin_checksum(trial_prefix)
+                    if chk == cand[14] or cand[14] in CONFUSABLE_MAP.get(chk, []):
+                        trial_cand = f"{trial_prefix}{chk}"
+                        if is_valid_gstin(trial_cand, verify_checksum=True):
+                            return trial_cand
+                except Exception:
+                    continue
+
+        # 4. Tier 3: Non-destructive fallback — if checksum cannot be satisfied, return structurally valid 15-character string rather than dropping to None
+        if is_valid_gstin(cand_str, verify_checksum=False):
+            return cand_str
+
+        return None
+
     def find_gstin(self, text: str, verify_checksum: bool = True) -> str | None:
         """
         Space-agnostic, symbol-mapped sliding window extractor for Indian GSTINs.
@@ -205,6 +297,8 @@ class DocumentOCRPipeline:
         # Step 2: Strip all non-alphanumeric chars (removes spaces, colons, hyphens)
         cleaned = re.sub(r"[^A-Za-z0-9]", "", text).upper()
 
+        format_valid_fallback = None
+
         # Step 3: Slide 15-character window across continuous token stream
         for i in range(len(cleaned) - 14):
             raw_window = list(cleaned[i:i+15])
@@ -213,9 +307,12 @@ class DocumentOCRPipeline:
             if is_valid_gstin(raw_candidate, verify_checksum=verify_checksum):
                 return raw_candidate
 
-            repaired = self.repair_gstin_slot(raw_window)
-            if is_valid_gstin(repaired, verify_checksum=verify_checksum):
-                return repaired
+            repaired = self.repair_gstin_with_checksum_permutations(raw_candidate)
+            if repaired:
+                if is_valid_gstin(repaired, verify_checksum=True):
+                    return repaired
+                elif format_valid_fallback is None and is_valid_gstin(repaired, verify_checksum=False):
+                    format_valid_fallback = repaired
 
         # Fallback to format-only regex match only when verify_checksum is explicitly False
         if not verify_checksum:
@@ -224,9 +321,10 @@ class DocumentOCRPipeline:
                 raw_candidate = "".join(raw_window)
                 if is_valid_gstin(raw_candidate, verify_checksum=False):
                     return raw_candidate
-                repaired = self.repair_gstin_slot(raw_window)
-                if is_valid_gstin(repaired, verify_checksum=False):
+                repaired = self.repair_gstin_with_checksum_permutations(raw_candidate)
+                if repaired and is_valid_gstin(repaired, verify_checksum=False):
                     return repaired
+            return format_valid_fallback
 
         return None
 

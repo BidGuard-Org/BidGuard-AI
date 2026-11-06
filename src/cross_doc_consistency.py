@@ -68,26 +68,34 @@ class CrossDocumentConsistencyEngine:
         Verifies if characters 3 to 13 of GSTIN match the 10-character PAN.
         Format: 2 digits State Code + 10 chars PAN + 1 char entity + 1 char 'Z' + 1 checksum char.
         """
-        if not pan_number or not gstin_number or len(gstin_number) < 13:
+        if not pan_number or not gstin_number or len(str(gstin_number).strip()) < 12:
             return {
                 "check": "PAN Embedded in GSTIN Check",
+                "flag": "PAN_MISMATCH_IN_GSTIN",
                 "status": "FAIL",
                 "passed": False,
-                "reason": "Invalid or missing PAN/GSTIN string length."
+                "severity": "CRITICAL",
+                "discrepancy_detected": True,
+                "pan": str(pan_number) if pan_number else None,
+                "gstin_extracted_pan": None,
+                "reason": "Invalid or missing PAN/GSTIN string length for cross-document reconciliation."
             }
 
-        embedded_pan = gstin_number.strip().upper()[2:12]
-        clean_pan = pan_number.strip().upper()
+        embedded_pan = str(gstin_number).strip().upper()[2:12]
+        clean_pan = str(pan_number).strip().upper()
 
         match = embedded_pan == clean_pan
 
         return {
             "check": "PAN Embedded in GSTIN Check",
+            "flag": "PAN_MATCH_VERIFIED" if match else "PAN_MISMATCH_IN_GSTIN",
             "status": "PASS" if match else "FAIL",
             "passed": match,
+            "severity": "NONE" if match else "CRITICAL",
+            "discrepancy_detected": not match,
             "pan": clean_pan,
             "gstin_extracted_pan": embedded_pan,
-            "reason": None if match else f"Embedded PAN '{embedded_pan}' in GSTIN does not match standalone PAN '{clean_pan}'"
+            "reason": None if match else f"CRITICAL FORENSIC MISMATCH: Embedded PAN '{embedded_pan}' in GSTIN does not match standalone PAN '{clean_pan}'."
         }
 
     def evaluate_dossier_consistency(self, dossier: Dict[str, Any]) -> Dict[str, Any]:
@@ -95,24 +103,61 @@ class CrossDocumentConsistencyEngine:
         Aggregates cross-document validation across all submitted records.
         """
         checks: List[Dict[str, Any]] = []
+        discrepancies: List[Dict[str, Any]] = []
 
         # 1. PAN vs GSTIN validation
         pan = dossier.get("pan_card", {}).get("pan_number")
         gstin = dossier.get("gst_certificate", {}).get("gstin")
         if pan and gstin:
-            checks.append(self.check_pan_in_gstin(pan, gstin))
+            pan_check = self.check_pan_in_gstin(pan, gstin)
+            checks.append(pan_check)
+            if not pan_check["passed"]:
+                discrepancies.append({
+                    "flag": pan_check["flag"],
+                    "severity": pan_check["severity"],
+                    "check": pan_check["check"],
+                    "field_a": "pan_card.pan_number",
+                    "val_a": pan_check["pan"],
+                    "field_b": "gst_certificate.embedded_pan",
+                    "val_b": pan_check["gstin_extracted_pan"],
+                    "details": pan_check["reason"]
+                })
 
         # 2. Entity Legal Name across docs
         name_gst = dossier.get("gst_certificate", {}).get("legal_name")
         name_pan = dossier.get("pan_card", {}).get("legal_name")
         if name_gst and name_pan:
-            checks.append(self.check_entity_name_consistency(name_gst, name_pan, "GST Certificate", "PAN Card"))
+            name_check = self.check_entity_name_consistency(name_gst, name_pan, "GST Certificate", "PAN Card")
+            checks.append(name_check)
+            if not name_check["passed"]:
+                discrepancies.append({
+                    "flag": "ENTITY_NAME_MISMATCH",
+                    "severity": "HIGH",
+                    "check": name_check["check"],
+                    "field_a": "gst_certificate.legal_name",
+                    "val_a": name_check.get("val_a"),
+                    "field_b": "pan_card.legal_name",
+                    "val_b": name_check.get("val_b"),
+                    "details": name_check.get("reason")
+                })
 
         # 3. Turnover reconciliation
         turnover_gst = dossier.get("gst_certificate", {}).get("annual_turnover")
         turnover_bs = dossier.get("balance_sheet", {}).get("audited_turnover") if dossier.get("balance_sheet") else None
         if turnover_gst is not None and turnover_bs is not None:
-            checks.append(self.check_turnover_consistency(turnover_gst, turnover_bs))
+            turnover_check = self.check_turnover_consistency(turnover_gst, turnover_bs)
+            checks.append(turnover_check)
+            if not turnover_check["passed"]:
+                discrepancies.append({
+                    "flag": "TURNOVER_VARIANCE_EXCEEDED",
+                    "severity": "HIGH",
+                    "check": turnover_check["check"],
+                    "field_a": "gst_certificate.annual_turnover",
+                    "val_a": turnover_check.get("gst_turnover"),
+                    "field_b": "balance_sheet.audited_turnover",
+                    "val_b": turnover_check.get("bs_turnover"),
+                    "details": turnover_check.get("reason")
+                })
         else:
             checks.append({
                 "check": "Turnover Consistency: GST vs Balance Sheet",
@@ -123,11 +168,14 @@ class CrossDocumentConsistencyEngine:
 
         inconsistency_count = sum(1 for c in checks if not c["passed"])
         is_fully_consistent = (inconsistency_count == 0) and len(checks) > 0
+        critical_discrepancy_count = sum(1 for d in discrepancies if d.get("severity") == "CRITICAL")
 
         return {
             "is_fully_consistent": is_fully_consistent,
             "total_checks_run": len(checks),
             "inconsistency_count": inconsistency_count,
+            "critical_discrepancy_count": critical_discrepancy_count,
+            "discrepancies": discrepancies,
             "audit_trail": checks
         }
 

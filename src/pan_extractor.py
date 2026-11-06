@@ -83,20 +83,21 @@ PAN_BOILERPLATE_HEADERS = [
 ]
 
 # Field Identification Bilingual Marker Keywords
-NAME_LABELS = ["NAME", "नाम", "CARDHOLDER NAME", "APPLICANT NAME"]
+NAME_LABELS = ["NAME", "नाम", "CARDHOLDER NAME", "APPLICANT NAME", "LEGAL ENTITY", "LEGAL NAME", "NAME OF HOLDER"]
 FATHER_NAME_LABELS = ["FATHER'S NAME", "FATHERS NAME", "FATHER NAME", "पिता का नाम", "पिता"]
 DOB_LABELS = ["DATE OF BIRTH", "DOB", "जन्म तिथि", "जन्म तारीख", "DATE OF INCORPORATION", "निगमन की तारीख"]
 PAN_LABELS = ["PERMANENT ACCOUNT NUMBER", "PAN", "स्थायी लेखा संख्या"]
 
 # Comprehensive Bilingual Label Token Set for Pure Label Detection & Stripping
 LABEL_TOKENS = {
-    "NAME", "नाम", "CARDHOLDER", "APPLICANT",
+    "NAME", "नाम", "CARDHOLDER", "APPLICANT", "HOLDER", "HOLDERS", "HOLDER'S", "APPLICANTS", "CARDHOLDERS",
+    "LEGAL", "ENTITY", "REGISTRATION", "INCORPORATION", "निगमन",
     "FATHER", "FATHERS", "FATHER'S", "पिता", "का", "की", "के",
     "DOB", "BIRTH", "DATE", "OF", "जन्म", "तारीख", "तिथि",
-    "INCORPORATION", "निगमन",
     "PAN", "PERMANENT", "ACCOUNT", "NUMBER", "CARD", "स्थायी", "लेखा", "संख्या", "कार्ड",
-    "SIGNATURE", "हस्ताक्षर", "PHOTO", "फोटो", "GOVT", "GOVERNMENT", "INDIA", "BHARAT",
-    "INCOME", "TAX", "DEPARTMENT", "आयकर", "विभाग", "भारत", "सरकार"
+    "SIGNATURE", "हस्ताक्षर", "HASTAKSHAR", "PHOTO", "फोटो", "GOVT", "GOVERNMENT", "INDIA", "BHARAT",
+    "INCOME", "TAX", "DEPARTMENT", "आयकर", "विभाग", "भारत", "सरकार",
+    "MALE", "FEMALE", "GENDER", "SHRI", "SMT", "KUMARI"
 }
 
 
@@ -106,7 +107,23 @@ def is_label_only_line(text: str) -> bool:
     tokens = clean.split()
     if not tokens:
         return True
-    return all(tok in LABEL_TOKENS or tok == "S" for tok in tokens)
+    return all(tok in LABEL_TOKENS or tok in ["S", "D", "W", "CO"] for tok in tokens)
+
+
+def is_name_label_line(text: str) -> bool:
+    """Checks whether token/line represents a Cardholder or Legal Entity Name label."""
+    clean = re.sub(r"[^\w\s\u0900-\u097F]", " ", text).strip().upper()
+    tokens = set(clean.split())
+    if any(f in tokens for f in ["FATHER", "FATHERS", "पिता"]):
+        return False
+    return bool(tokens & {"NAME", "नाम", "CARDHOLDER", "APPLICANT", "HOLDER"}) or ("LEGAL" in tokens and "ENTITY" in tokens)
+
+
+def is_father_label_line(text: str) -> bool:
+    """Checks whether token/line represents a Father's Name label."""
+    clean = re.sub(r"[^\w\s\u0900-\u097F]", " ", text).strip().upper()
+    tokens = set(clean.split())
+    return any(f in tokens for f in ["FATHER", "FATHERS", "पिता"]) or "FATHER" in clean
 
 
 def strip_label_prefix(text: str) -> str:
@@ -115,7 +132,7 @@ def strip_label_prefix(text: str) -> str:
     idx = 0
     while idx < len(words):
         w_clean = re.sub(r"[^\w\u0900-\u097F]", "", words[idx]).upper()
-        if w_clean in LABEL_TOKENS or w_clean in ["S"]:
+        if not w_clean or w_clean in LABEL_TOKENS or w_clean in ["S", "D", "W", "CO"]:
             idx += 1
         else:
             break
@@ -221,10 +238,11 @@ def check_aadhaar_contamination(raw_text: str, ocr_items: List[Dict[str, Any]]) 
         "MERI PEHCHAN",
         "आधार",
         "HELP@UIDAI.GOV.IN",
-        "WWW.UIDAI.GOV.IN",
-        "VID"
+        "WWW.UIDAI.GOV.IN"
     ]
     if any(k in t_up or k in raw_text for k in aadhaar_keywords):
+        return True
+    if re.search(r'\bVID\b', t_up) or re.search(r'\bVID\s*:', t_up):
         return True
     if re.search(AADHAAR_SPACED_REGEX, t_up) or re.search(AADHAAR_CONTINUOUS_REGEX, t_up):
         return True
@@ -286,7 +304,7 @@ def extract_pan_details(
 
     # 2. Normalize OCR items with Page Awareness
     all_items: List[Dict[str, Any]] = []
-    for item in ocr_items:
+    for idx, item in enumerate(ocr_items):
         txt = item.get("text", "").strip()
         if not txt:
             continue
@@ -294,7 +312,7 @@ def extract_pan_details(
         conf_val = item.get("conf")
         conf = float(conf_val) if conf_val is not None else None
         page = int(item.get("page", page_number))
-        y0 = bbox[1] if (bbox and len(bbox) > 1) else 0
+        y0 = bbox[1] if (bbox and len(bbox) > 1) else (idx * 30)
         x0 = bbox[0] if (bbox and len(bbox) > 0) else 0
         h = (bbox[3] - bbox[1]) if (bbox and len(bbox) > 3) else 20
         all_items.append({
@@ -373,7 +391,18 @@ def extract_pan_details(
         })
 
     entity_type = get_pan_entity_type(extracted_pan)
-    is_corporate = (extracted_pan != "NOT DETECTED" and len(extracted_pan) == 10 and extracted_pan[3] in ["C", "F", "L", "G", "J"])
+    pan_char4 = extracted_pan[3] if (extracted_pan != "NOT DETECTED" and len(extracted_pan) == 10) else ""
+    corp_entity_codes = {"C", "F", "A", "T", "B", "L", "J", "G", "H"}
+
+    corp_phrases = [
+        "PVT LTD", "PRIVATE LIMITED", "LTD", "LIMITED",
+        "ENTERPRISES", "INCORPORATION", "ASSOCIATES", "SOLUTIONS",
+        "LLP", "CORP", "CORPORATION", "LOGISTICS", "INFRA",
+        "LEGAL ENTITY"
+    ]
+    raw_upper = raw_text.upper()
+    has_corp_text = any(cp in raw_upper for cp in corp_phrases)
+    is_corporate = (pan_char4 in corp_entity_codes) or (has_corp_text and pan_char4 != "P") or any(cp in raw_upper for cp in ["PVT LTD", "PRIVATE LIMITED", "LIMITED", "ENTERPRISES PVT"])
 
     # -------------------------------------------------------------
     # 4. Extract Date of Birth / Incorporation Date
@@ -431,25 +460,38 @@ def extract_pan_details(
     father_method = "NOT_AVAILABLE"
 
     # Identify vertical anchor boundaries for bilingual labels
+    y_name_label = None
     y_father_label = None
+    y_dob_label = None
 
     for it in sorted_items:
-        t_up = it["text"].upper()
-        if is_label_only_line(it["text"]):
-            if any(fl in t_up for fl in FATHER_NAME_LABELS) and y_father_label is None:
-                y_father_label = it["y0"]
+        t_raw = it["text"].strip()
+        t_up = t_raw.upper()
+        if is_name_label_line(t_raw) and y_name_label is None:
+            y_name_label = it["y0"]
+        elif is_father_label_line(t_raw) and y_father_label is None:
+            y_father_label = it["y0"]
+        elif any(dl in t_up for dl in DOB_LABELS) and y_dob_label is None:
+            y_dob_label = it["y0"]
 
-    # Filter candidate name lines: alphabetic text, length >= 3, not boilerplate, not PAN, not Date
-    candidate_items: List[Dict[str, Any]] = []
+    all_x = [it["bbox"][2] for it in sorted_items if it.get("bbox") and len(it["bbox"]) > 2]
+    max_x = max(all_x) if all_x else 1000
+
+    # Filter candidate name tokens: alphabetic text, length >= 3, not boilerplate, not PAN, not Date
+    raw_candidates: List[Dict[str, Any]] = []
     for item in sorted_items:
         t_raw = item["text"].strip()
         t_up = t_raw.upper()
 
         if any(h in t_up for h in PAN_BOILERPLATE_HEADERS):
             continue
-        if is_label_only_line(t_raw):
-            continue
         if re.search(PAN_REGEX, t_up) or re.search(DATE_REGEX, t_up):
+            continue
+        if item["conf"] is not None and item["conf"] < 0.35:
+            continue
+        if item["conf"] is not None and item["conf"] < 0.60 and item.get("x0", 0) > max_x * 0.85:
+            continue
+        if is_label_only_line(t_raw):
             continue
 
         cleaned_text = strip_label_prefix(t_raw)
@@ -464,13 +506,76 @@ def extract_pan_details(
         if not words:
             continue
 
-        candidate_items.append({
+        raw_candidates.append({
             "text": alpha_only,
             "bbox": item["bbox"],
             "conf": item["conf"],
             "method": item["extraction_method"],
             "y0": item["y0"],
+            "x0": item.get("x0", 0),
             "h": item["h"]
+        })
+
+    # Group tokens that lie on the same horizontal line
+    grouped_lines: List[Dict[str, Any]] = []
+    for c in raw_candidates:
+        if not grouped_lines:
+            grouped_lines.append({
+                "tokens": [c],
+                "y0": c["y0"],
+                "h": c["h"]
+            })
+        else:
+            prev_line = grouped_lines[-1]
+            prev_y1 = prev_line["y0"] + prev_line["h"]
+            c_y1 = c["y0"] + c["h"]
+            overlap = min(prev_y1, c_y1) - max(prev_line["y0"], c["y0"])
+            min_h = min(prev_line["h"], c["h"])
+            # Tokens belong to the same text line only if their vertical heights overlap significantly (> 40%)
+            # or their top edges align tightly (<= 6px)
+            if overlap > 0.4 * min_h or abs(c["y0"] - prev_line["y0"]) <= min(6, int(min_h * 0.35)):
+                prev_line["tokens"].append(c)
+                prev_line["y0"] = min(prev_line["y0"], c["y0"])
+                prev_line["h"] = max(prev_y1, c_y1) - prev_line["y0"]
+            else:
+                grouped_lines.append({
+                    "tokens": [c],
+                    "y0": c["y0"],
+                    "h": c["h"]
+                })
+
+    candidate_items: List[Dict[str, Any]] = []
+    for g in grouped_lines:
+        toks = sorted(g["tokens"], key=lambda t: t["x0"])
+        # Clean each token by filtering out pure label words
+        tok_words = []
+        for t in toks:
+            w_list = [w for w in t["text"].split() if w.upper() not in LABEL_TOKENS and (len(w) > 1 or w in ["&"])]
+            tok_words.extend(w_list)
+        line_text = " ".join(tok_words).strip()
+        line_text = strip_label_prefix(line_text)
+        if not line_text or is_label_only_line(line_text):
+            continue
+
+        confs = [t["conf"] for t in toks if t["conf"] is not None]
+        avg_conf = float(np.mean(confs)) if confs else None
+        first_tok = toks[0]
+        last_tok = toks[-1]
+        bbox = None
+        if first_tok.get("bbox") and last_tok.get("bbox"):
+            bbox = [
+                min(first_tok["bbox"][0], last_tok["bbox"][0]),
+                min(t["bbox"][1] for t in toks if t.get("bbox")),
+                max(first_tok["bbox"][2], last_tok["bbox"][2]),
+                max(t["bbox"][3] for t in toks if t.get("bbox"))
+            ]
+        candidate_items.append({
+            "text": line_text,
+            "bbox": bbox or first_tok["bbox"],
+            "conf": avg_conf,
+            "method": first_tok["method"],
+            "y0": g["y0"],
+            "h": g["h"]
         })
 
     ambiguous_evidence = False
@@ -480,46 +585,64 @@ def extract_pan_details(
             # Corporate / Firm PAN cards: combine multi-line legal company name
             corp_candidates = []
             for c in candidate_items:
-                corp_candidates.append(c["text"])
+                if y_name_label is not None and c["y0"] < (y_name_label - 5):
+                    continue
+                if y_dob_label is not None and c["y0"] >= (y_dob_label - 5):
+                    break
+                corp_candidates.append(c)
                 if any(w in c["text"].upper() for w in ["LTD", "LIMITED", "PVT", "LLP", "CORP", "ASSOCIATES", "PARTNERS", "ENTERPRISES"]):
                     break
-            cardholder_name = " ".join(corp_candidates) if corp_candidates else candidate_items[0]["text"]
-            name_conf = round(candidate_items[0]["conf"], 3) if candidate_items[0]["conf"] is not None else None
-            name_bbox = candidate_items[0]["bbox"]
-            name_method = candidate_items[0]["method"]
+            selected_corp = corp_candidates if corp_candidates else candidate_items[:1]
+            cardholder_name = " ".join([c["text"] for c in selected_corp])
+            c_confs = [c["conf"] for c in selected_corp if c["conf"] is not None]
+            name_conf = round(float(np.mean(c_confs)), 3) if c_confs else None
+            name_bbox = selected_corp[0]["bbox"]
+            name_method = selected_corp[0]["method"]
             father_name = None
         else:
             # Individual PAN cards:
             c1_lines = []
             c2_lines = []
+            pan_surname_char = extracted_pan[4] if (extracted_pan != "NOT DETECTED" and len(extracted_pan) == 10 and extracted_pan[3] == "P") else None
 
             if y_father_label is not None:
                 # Label-anchored separation
+                above_father = []
+                below_father = []
                 for c in candidate_items:
+                    if y_name_label is not None and c["y0"] < (y_name_label - 5):
+                        continue
                     if c["y0"] < y_father_label:
-                        c1_lines.append(c)
+                        above_father.append(c)
                     else:
-                        c2_lines.append(c)
+                        if y_dob_label is not None and c["y0"] >= (y_dob_label - 5):
+                            break
+                        below_father.append(c)
+
+                c1_lines = above_father
+                c2_lines = below_father
+
             elif len(candidate_items) == 2:
                 # Standard individual card without labels: line 1 is cardholder, line 2 is father
-                c1_lines.append(candidate_items[0])
-                c2_lines.append(candidate_items[1])
+                c1_lines = [candidate_items[0]]
+                c2_lines = [candidate_items[1]]
             elif len(candidate_items) > 2:
-                # 3 or more candidate lines without labels: multi-line cardholder followed by father
-                c1_lines.append(candidate_items[0])
-                idx = 1
-                while idx < len(candidate_items):
-                    prev_c = c1_lines[-1]
-                    curr_c = candidate_items[idx]
-                    gap = curr_c["y0"] - (prev_c["y0"] + prev_c["h"])
-                    if gap <= max(15, int(prev_c["h"] * 0.8)) and len(c1_lines) < 2 and (len(candidate_items) - idx) >= 1:
-                        c1_lines.append(curr_c)
-                        idx += 1
+                if pan_surname_char:
+                    words_c0 = candidate_items[0]["text"].split()
+                    words_c1 = candidate_items[1]["text"].split()
+                    c0_match = bool(words_c0 and words_c0[-1].upper().startswith(pan_surname_char))
+                    c1_match = bool(words_c1 and words_c1[-1].upper().startswith(pan_surname_char))
+
+                    if not c0_match and c1_match:
+                        # candidate_items[0] is a header/noise line; candidate_items[1] is the cardholder name
+                        c1_lines = [candidate_items[1]]
+                        c2_lines = [candidate_items[2]]
                     else:
-                        break
-                while idx < len(candidate_items):
-                    c2_lines.append(candidate_items[idx])
-                    idx += 1
+                        c1_lines = [candidate_items[0]]
+                        c2_lines = [candidate_items[1]]
+                else:
+                    c1_lines = [candidate_items[0]]
+                    c2_lines = [candidate_items[1]]
             else:
                 c1_lines = candidate_items
 
