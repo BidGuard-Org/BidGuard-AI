@@ -116,8 +116,16 @@ def predict_bidder_risk(p7_result, p9_result, lineage_records, use_fastapi: bool
     comp_pct = (compliant / total_reqs) * 100.0 if total_reqs > 0 else 0.0
 
     # Vision confidence extraction from Phase 6 lineage
-    conf_scores = [item.get("confidence", 0.95) for item in lineage_records if isinstance(item, dict) and "confidence" in item]
-    avg_conf = float(np.mean(conf_scores)) if conf_scores else 0.95
+    conf_scores = [item.get("confidence") for item in lineage_records if isinstance(item, dict) and "confidence" in item]
+    valid_confs = []
+    for c in conf_scores:
+        try:
+            val = float(c)
+            if not np.isnan(val):
+                valid_confs.append(val)
+        except (ValueError, TypeError):
+            continue
+    avg_conf = float(np.mean(valid_confs)) if valid_confs else 0.95
     doc_quality = 1.0 if avg_conf >= 0.85 else 0.5
 
     # Specific failure indicators

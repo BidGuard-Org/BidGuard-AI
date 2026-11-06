@@ -56,11 +56,19 @@ def run_ml_risk_prediction(
     comp_pct = (compliant / total_reqs) * 100.0 if total_reqs > 0 else 0.0
 
     conf_scores = [
-        item.get("confidence", 0.95)
+        item.get("confidence")
         for item in lineage_records
-        if isinstance(item, dict) and isinstance(item.get("confidence"), (int, float))
+        if isinstance(item, dict) and "confidence" in item
     ]
-    avg_conf = float(np.mean(conf_scores)) if conf_scores else 0.95
+    valid_confs = []
+    for c in conf_scores:
+        try:
+            val = float(c)
+            if not np.isnan(val):
+                valid_confs.append(val)
+        except (ValueError, TypeError):
+            continue
+    avg_conf = float(np.mean(valid_confs)) if valid_confs else 0.95
     doc_quality = 1.0 if avg_conf >= 0.85 else 0.5
 
     fin_fail = 1 if any(
