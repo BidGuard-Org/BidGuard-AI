@@ -1,3 +1,4 @@
+import difflib
 from typing import Dict, Any, List
 
 class CrossDocumentConsistencyEngine:
@@ -13,27 +14,96 @@ class CrossDocumentConsistencyEngine:
     def check_entity_name_consistency(self, name_doc_a: str, name_doc_b: str, doc_a_label: str, doc_b_label: str) -> Dict[str, Any]:
         """
         Checks if bidder entity legal name matches across two different documents.
+        Supports exact match (PASS), borderline fuzzy/abbreviation match (REVIEW),
+        and outright mismatch (FAIL).
         """
         if not name_doc_a or not name_doc_b:
             return {
                 "check": f"Entity Name: {doc_a_label} vs {doc_b_label}",
                 "status": "FAIL",
+                "severity": "HIGH",
                 "passed": False,
+                "discrepancy_detected": True,
                 "reason": f"Missing name field in one or both documents ({doc_a_label}: '{name_doc_a}', {doc_b_label}: '{name_doc_b}')"
             }
 
         clean_a = name_doc_a.strip().upper()
         clean_b = name_doc_b.strip().upper()
 
-        match = clean_a == clean_b
-        return {
-            "check": f"Entity Name: {doc_a_label} vs {doc_b_label}",
-            "status": "PASS" if match else "FAIL",
-            "passed": match,
-            "val_a": clean_a,
-            "val_b": clean_b,
-            "reason": None if match else f"Conflict detected: '{clean_a}' in {doc_a_label} does not match '{clean_b}' in {doc_b_label}"
-        }
+        if clean_a == clean_b:
+            return {
+                "check": f"Entity Name: {doc_a_label} vs {doc_b_label}",
+                "status": "PASS",
+                "severity": "NONE",
+                "passed": True,
+                "discrepancy_detected": False,
+                "val_a": clean_a,
+                "val_b": clean_b,
+                "similarity_score": 100.0,
+                "reason": None
+            }
+
+        similarity = round(difflib.SequenceMatcher(None, clean_a, clean_b).ratio() * 100.0, 1)
+
+        # Check if difference is a valid corporate abbreviation/suffix variation (e.g. PVT LTD vs PRIVATE LIMITED)
+        corp_keywords = ["PVT LTD", "PRIVATE LIMITED", "LTD", "LIMITED", "LLP"]
+        has_corp_a = any(clean_a.endswith(k) for k in corp_keywords)
+        has_corp_b = any(clean_b.endswith(k) for k in corp_keywords)
+
+        # If one entity claims corporate incorporation while the other lacks any corporate suffix,
+        # it is an entity-type conflict rather than a minor abbreviation variation
+        if has_corp_a != has_corp_b and similarity < 90.0:
+            note = f"Conflict detected: '{clean_a}' in {doc_a_label} does not match '{clean_b}' in {doc_b_label} (Similarity: {similarity}%)"
+            return {
+                "check": f"Entity Name: {doc_a_label} vs {doc_b_label}",
+                "status": "FAIL",
+                "severity": "HIGH",
+                "passed": False,
+                "discrepancy_detected": True,
+                "val_a": clean_a,
+                "val_b": clean_b,
+                "similarity_score": similarity,
+                "reason": note
+            }
+
+        if similarity >= 90.0:
+            return {
+                "check": f"Entity Name: {doc_a_label} vs {doc_b_label}",
+                "status": "PASS",
+                "severity": "NONE",
+                "passed": True,
+                "discrepancy_detected": False,
+                "val_a": clean_a,
+                "val_b": clean_b,
+                "similarity_score": similarity,
+                "reason": None
+            }
+        elif 70.0 <= similarity < 90.0:
+            note = f"Minor name variation detected: '{clean_a}' vs '{clean_b}' (Similarity: {similarity}%)"
+            return {
+                "check": f"Entity Name: {doc_a_label} vs {doc_b_label}",
+                "status": "REVIEW",
+                "severity": "MEDIUM",
+                "passed": False,
+                "discrepancy_detected": True,
+                "val_a": clean_a,
+                "val_b": clean_b,
+                "similarity_score": similarity,
+                "reason": note
+            }
+        else:
+            note = f"Conflict detected: '{clean_a}' in {doc_a_label} does not match '{clean_b}' in {doc_b_label} (Similarity: {similarity}%)"
+            return {
+                "check": f"Entity Name: {doc_a_label} vs {doc_b_label}",
+                "status": "FAIL",
+                "severity": "HIGH",
+                "passed": False,
+                "discrepancy_detected": True,
+                "val_a": clean_a,
+                "val_b": clean_b,
+                "similarity_score": similarity,
+                "reason": note
+            }
 
     def check_turnover_consistency(self, turnover_gst: float, turnover_balance_sheet: float) -> Dict[str, Any]:
         """
@@ -130,16 +200,32 @@ class CrossDocumentConsistencyEngine:
             name_check = self.check_entity_name_consistency(name_gst, name_pan, "GST Certificate", "PAN Card")
             checks.append(name_check)
             if not name_check["passed"]:
+                flag = "NAME_VARIATION_REVIEW" if name_check.get("status") == "REVIEW" else "ENTITY_NAME_MISMATCH"
                 discrepancies.append({
-                    "flag": "ENTITY_NAME_MISMATCH",
-                    "severity": "HIGH",
+                    "flag": flag,
+                    "severity": name_check.get("severity", "MEDIUM" if name_check.get("status") == "REVIEW" else "HIGH"),
                     "check": name_check["check"],
                     "field_a": "gst_certificate.legal_name",
                     "val_a": name_check.get("val_a"),
                     "field_b": "pan_card.legal_name",
                     "val_b": name_check.get("val_b"),
-                    "details": name_check.get("reason")
+                    "details": name_check.get("reason"),
+                    "similarity_score": name_check.get("similarity_score")
                 })
+        elif name_gst or name_pan:
+            checks.append({
+                "check": "Entity Name: GST Certificate vs PAN Card",
+                "status": "NOT PROVIDED",
+                "passed": True,
+                "reason": "Single document provided; cross-entity name reconciliation skipped."
+            })
+        else:
+            checks.append({
+                "check": "Entity Name: GST Certificate vs PAN Card",
+                "status": "NOT PROVIDED",
+                "passed": True,
+                "reason": "Entity names not detected in submitted documents; reconciliation skipped."
+            })
 
         # 3. Turnover reconciliation
         turnover_gst = dossier.get("gst_certificate", {}).get("annual_turnover")

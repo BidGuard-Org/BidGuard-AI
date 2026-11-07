@@ -160,7 +160,8 @@ def predict_bidder_risk(p7_result, p9_result, lineage_records, use_fastapi: bool
             pred_class = api_prediction.get("predicted_risk_level", "LOW")
             probs = api_prediction.get("prediction_probabilities", {})
             confidence = float(probs.get(pred_class, 0.95))
-            return pred_class, confidence, "FASTAPI"
+            prob_map = {str(k).upper(): float(v) for k, v in probs.items()}
+            return pred_class, confidence, "FASTAPI", prob_map
 
     if risk_model is not None and risk_scaler is not None:
         try:
@@ -178,6 +179,7 @@ def predict_bidder_risk(p7_result, p9_result, lineage_records, use_fastapi: bool
             probs = risk_model.predict_proba(X_scaled_df)[0]
             class_idx = list(risk_model.classes_).index(pred_class)
             confidence = float(probs[class_idx])
+            prob_map = {str(cls).upper(): float(p) for cls, p in zip(risk_model.classes_, probs)}
 
             # Terminal verification log
             print("\n" + "="*50)
@@ -187,13 +189,64 @@ def predict_bidder_risk(p7_result, p9_result, lineage_records, use_fastapi: bool
             print(f"Final Decision: {pred_class} with Confidence: {confidence:.4f}")
             print("="*50 + "\n")
 
-            return pred_class, confidence, True
+            return pred_class, confidence, True, prob_map
         except Exception as e:
             print(f"[WARN] Inference exception: {e}")
 
     # Fallback heuristic if model files are unreadable
     fallback_class = "LOW" if (non_compliant + inconsistencies) == 0 else "HIGH"
-    return fallback_class, 0.95, False
+    fallback_prob = 1.0 if fallback_class == "LOW" else 0.95
+    fallback_probs = {
+        "LOW": 1.0 if fallback_class == "LOW" else 0.0,
+        "MEDIUM": 0.0,
+        "HIGH": 0.95 if fallback_class == "HIGH" else 0.0
+    }
+    return fallback_class, fallback_prob, False, fallback_probs
+
+def get_risk_badge_components(risk_rating: str, risk_prob: float, prob_map: dict):
+    """
+    Constructs clear risk badge label, colors, sub-caption, and probability breakdown
+    for transparent examiner review.
+    """
+    p_low = prob_map.get("LOW", 0.0) * 100.0
+    p_med = prob_map.get("MEDIUM", 0.0) * 100.0
+    p_high = prob_map.get("HIGH", 0.0) * 100.0
+    conf_pct = risk_prob * 100.0
+
+    if risk_rating == "LOW":
+        badge_label = f"✓ {conf_pct:.0f}% Confident: Safe / Low Risk" if round(conf_pct, 1) == 100.0 else f"✓ {conf_pct:.1f}% Confident: Safe / Low Risk"
+        badge_color = "#4ade80"  # Green
+        badge_bg = "#14361b"
+        badge_border = "#2e7d32"
+        sub_caption = f"[Low: {p_low:.1f}%, Med: {p_med:.1f}%, High: {p_high:.1f}%]"
+        delta_color = "normal"
+    elif risk_rating == "MEDIUM":
+        badge_label = f"⚠ {conf_pct:.1f}% Confident: Borderline Review"
+        badge_color = "#fbbf24"  # Amber
+        badge_bg = "#3d2d00"
+        badge_border = "#f59e0b"
+        sub_caption = f"[Low: {p_low:.1f}%, Med: {p_med:.1f}%, High: {p_high:.1f}%]"
+        delta_color = "off"
+    else:  # HIGH or CRITICAL
+        h_val = p_high if p_high > 0 else conf_pct
+        badge_label = f"🚨 {conf_pct:.1f}% Confident: High Risk / Fraud"
+        badge_color = "#f87171"  # Red
+        badge_bg = "#451216"
+        badge_border = "#ef4444"
+        sub_caption = f"[High Risk: {h_val:.1f}%]"
+        delta_color = "inverse"
+
+    return {
+        "badge_label": badge_label,
+        "badge_color": badge_color,
+        "badge_bg": badge_bg,
+        "badge_border": badge_border,
+        "sub_caption": sub_caption,
+        "delta_color": delta_color,
+        "p_low": p_low,
+        "p_med": p_med,
+        "p_high": p_high
+    }
 
 def safe_log_decision(tender_id, bidder_id, action, remarks, lineage_data):
     """Phase 13: Immutable Local Adjudication Logger"""
@@ -663,7 +716,9 @@ if upload_mode == "Live Multi-Document Upload (Phase 6 Integration)":
         all_extracted_texts = res["all_extracted_texts"]
         audit_data = res["audit_data"]
         compliance_status = res["compliance_status"]
-        inconsistencies_count = res["discrepancies_count"]
+        # Scorecard discrepancy count reflects hard failures, forensic mismatches, and minor variations
+        p9_discrepancy_count = len(res.get("p9_result", {}).get("discrepancies", []))
+        inconsistencies_count = max(res.get("discrepancies_count", 0), p9_discrepancy_count)
         slots = res["slots"]
         company_name = slots["company_name"]
         gstin_no = slots["gstin_no"]
@@ -683,19 +738,20 @@ if upload_mode == "Live Multi-Document Upload (Phase 6 Integration)":
         bidder_id = f"BID-{uuid.uuid4().hex[:5].upper()}"
 
         # Execute Predictive ML Risk Classifier
-        pred_risk, risk_prob, is_ml = predict_bidder_risk(
+        pred_risk, risk_prob, is_ml, prob_map = predict_bidder_risk(
             res["p7_result"], res["p9_result"], current_lineage, use_fastapi=use_fastapi_client
         )
-        if is_ml == "FASTAPI":
-            badge_type = "🌐 FastAPI REST Client"
-            risk_badge = f"{risk_prob*100:.1f}% (FastAPI Microservice)"
-        elif is_ml is True:
-            badge_type = "\U0001F916 In-Process ML Model"
-            risk_badge = f"{risk_prob*100:.1f}% (ML Model)"
+        # Forensic hard override on critical discrepancy
+        p9_discrepancies = res.get("p9_result", {}).get("discrepancies", [])
+        p9_crit_count = res.get("p9_result", {}).get("critical_discrepancy_count", 0)
+        has_pan_mismatch = any(d.get("flag") == "PAN_MISMATCH_IN_GSTIN" for d in p9_discrepancies)
+
+        if p9_crit_count > 0 or has_pan_mismatch:
+            risk_rating = "CRITICAL"
+            compliance_status = "DISQUALIFIED"
         else:
-            badge_type = "Deterministic"
-            risk_badge = f"{risk_prob*100:.1f}% (Deterministic)"
-        risk_rating = pred_risk
+            risk_rating = pred_risk
+            compliance_status = res["compliance_status"]
     else:
         st.info("👈 Please upload vendor documents (GST Certificate, PAN Card, Balance Sheet, etc.) in the sidebar to begin.")
         st.stop()
@@ -724,6 +780,7 @@ elif upload_mode == "Pre-loaded Benchmark Dossiers":
         {"Stage": "Phase 7 Statutory", "Rule Checked": "Turnover Threshold", "Status": "PASS", "Finding Details": "Declared turnover meets tender limit."},
         {"Stage": "Phase 7 Statutory", "Rule Checked": "Document Validity", "Status": "PASS", "Finding Details": "Certificate issue date is valid."},
         {"Stage": "Phase 9 Forensic", "Rule Checked": "PAN Embedded inside GSTIN", "Status": "PASS" if is_clean else "FAIL", "Finding Details": f"GSTIN[2:12] vs PAN '{pan_no}'" + (" matched." if is_clean else " MISMATCH DETECTED!")},
+        {"Stage": "Phase 9 Forensic", "Rule Checked": "Entity Name: GST Certificate vs PAN Card", "Status": "PASS" if is_clean else "FAIL", "Finding Details": "Entity legal name matches across documents." if is_clean else "Conflict detected: 'Apex Enterprises' does not match PAN record."},
         {"Stage": "Phase 9 Forensic", "Rule Checked": "Turnover Variance (GST vs Balance Sheet)", "Status": "PASS" if is_clean else "FAIL", "Finding Details": "Discrepancy 0.0% within tolerance." if is_clean else "Variance 60.0% violates 5.0% tolerance limit."}
     ]
 
@@ -744,25 +801,21 @@ elif upload_mode == "Pre-loaded Benchmark Dossiers":
         "inconsistency_count": 0 if is_clean else 2,
         "audit_trail": [
             {"check": "PAN Embedded inside GSTIN", "status": "PASS" if is_clean else "FAIL"},
+            {"check": "Entity Name: GST Certificate vs PAN Card", "status": "PASS" if is_clean else "FAIL"},
             {"check": "Turnover Variance (GST vs Balance Sheet)", "status": "PASS" if is_clean else "FAIL"}
         ]
     }
 
     # Execute actual ML Model inference for benchmark dossiers
-    pred_risk, risk_prob, is_ml = predict_bidder_risk(
+    pred_risk, risk_prob, is_ml, prob_map = predict_bidder_risk(
         benchmark_p7, benchmark_p9, current_lineage, use_fastapi=use_fastapi_client
     )
-    if is_ml == "FASTAPI":
-        badge_type = "🌐 FastAPI REST Client"
-        risk_badge = f"{risk_prob*100:.1f}% (FastAPI Microservice)"
-    elif is_ml is True:
-        badge_type = "\U0001F916 In-Process ML Model"
-        risk_badge = f"{risk_prob*100:.1f}% (ML Model)"
+    if not is_clean:
+        risk_rating = "CRITICAL"
+        compliance_status = "DISQUALIFIED"
     else:
-        badge_type = "Deterministic"
-        risk_badge = f"{risk_prob*100:.1f}% (Deterministic)"
-    risk_rating = f"{pred_risk} RISK ({risk_prob*100:.1f}%)"
-    risk_badge = f"{risk_prob*100:.1f}% ({'ML Model' if is_ml else 'Deterministic'})"
+        risk_rating = pred_risk
+        compliance_status = "PASSED"
 
 else:
     st.info("\U0001F448 Please upload the primary **GST Certificate** in the sidebar to begin automated lineage verification.")
@@ -840,14 +893,55 @@ with col_left:
 with col_right:
     st.subheader("\U0001F50D Automated Forensic & Compliance Scorecard")
 
+    badge_info = get_risk_badge_components(risk_rating, risk_prob, prob_map)
+    risk_badge = badge_info["badge_label"]
+
     k1, k2, k3 = st.columns(3)
     k1.metric("Compliance Status", compliance_status)
     k2.metric("Discrepancies", f"{inconsistencies_count} Found")
-    k3.metric("Assigned Risk", f"{risk_rating} RISK", delta=risk_badge)
+    k3.metric("Assigned Risk", f"{risk_rating} RISK", delta=badge_info["badge_label"], delta_color=badge_info["delta_color"])
+
+    # Multi-class probability breakdown bar and softmax distribution caption
+    st.markdown(
+        f"""
+        <div style="background-color: {badge_info['badge_bg']}; border: 1px solid {badge_info['badge_border']}; border-radius: 8px; padding: 10px 14px; margin-top: 6px; margin-bottom: 12px;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <span style="font-weight: 700; font-size: 0.92em; color: {badge_info['badge_color']};">{badge_info['badge_label']}</span>
+                <span style="font-size: 0.82em; color: #ddd; font-family: monospace;">{badge_info['sub_caption']}</span>
+            </div>
+            <div style="margin-top: 8px; background-color: #222; border-radius: 4px; overflow: hidden; height: 8px; display: flex;">
+                <div style="width: {badge_info['p_low']}%; background-color: #4ade80;" title="Low Risk: {badge_info['p_low']:.1f}%"></div>
+                <div style="width: {badge_info['p_med']}%; background-color: #fbbf24;" title="Medium Risk: {badge_info['p_med']:.1f}%"></div>
+                <div style="width: {badge_info['p_high']}%; background-color: #f87171;" title="High Risk: {badge_info['p_high']:.1f}%"></div>
+            </div>
+            <div style="display: flex; justify-content: space-between; font-size: 0.78em; color: #bbb; margin-top: 5px;">
+                <span>🟢 Low: {badge_info['p_low']:.1f}%</span>
+                <span>🟡 Medium: {badge_info['p_med']:.1f}%</span>
+                <span>🔴 High: {badge_info['p_high']:.1f}%</span>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
 
     st.markdown("#### Lineage Verification Audit Trail")
     df_audit = pd.DataFrame(audit_data)
-    st.dataframe(df_audit, use_container_width=True, hide_index=True)
+
+    def style_audit_status(val):
+        s = str(val).upper()
+        if s in ["PASS", "VERIFIED"]:
+            return "background-color: #14361b; color: #4ade80; font-weight: bold;"
+        elif s in ["REVIEW", "PENDING_REVIEW", "NOT_VERIFIED"]:
+            return "background-color: #3d2d00; color: #fbbf24; font-weight: bold;"
+        elif s in ["FAIL", "FLAGGED"]:
+            return "background-color: #451216; color: #f87171; font-weight: bold;"
+        return ""
+
+    try:
+        styled_audit = df_audit.style.map(style_audit_status, subset=["Status"])
+        st.dataframe(styled_audit, use_container_width=True, hide_index=True)
+    except Exception:
+        st.dataframe(df_audit, use_container_width=True, hide_index=True)
 
     st.divider()
 

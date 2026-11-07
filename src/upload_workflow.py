@@ -692,8 +692,9 @@ class DocumentStagingQueue:
         bs_turnover_str = bs_info.get("bs_turnover_str", "NOT PROVIDED") if bs_docs else "NOT PROVIDED"
 
         # Cross-Document Consistency Engine Integration
-        norm_gst_name = re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9]+", " ", company_name.upper())).strip()
-        norm_pan_name = re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9]+", " ", pan_name.upper())).strip()
+        norm_gst_name = re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9]+", " ", company_name.upper())).strip() if (company_name and company_name != "NOT DETECTED") else None
+        norm_pan_name = re.sub(r"\s+", " ", re.sub(r"[^A-Z0-9]+", " ", pan_name.upper())).strip() if (pan_docs and pan_name and pan_name != "NOT DETECTED") else None
+        pan_num_for_dossier = standalone_pan if (pan_docs and standalone_pan != "NOT DETECTED") else None
 
         # Embedded PAN comparison
         pan_gstin_check = compare_pan_with_gstin(standalone_pan, gstin_no)
@@ -701,11 +702,11 @@ class DocumentStagingQueue:
         consistency_engine = CrossDocumentConsistencyEngine(turnover_tolerance_percentage=5.0)
         dossier = {
             "pan_card": {
-                "pan_number": standalone_pan,
+                "pan_number": pan_num_for_dossier,
                 "legal_name": norm_pan_name
             },
             "gst_certificate": {
-                "gstin": gstin_no,
+                "gstin": gstin_no if gstin_no != "NOT DETECTED" else None,
                 "legal_name": norm_gst_name,
                 "annual_turnover": gst_turnover
             },
@@ -789,19 +790,54 @@ class DocumentStagingQueue:
                     "Finding Details": f"Secondary PAN '{p_pan}' ({p_entity}) logged for partner/signatory '{p_name}' (Status: {p_name_status})."
                 })
 
-        # 3. Turnover Consistency (if Balance Sheet provided)
+        # 3. Cross-Document Consistency Checks (Entity Name & Turnover)
+        # Explicitly find and append the Entity Name cross-document check
+        name_check = next((c for c in p9_result.get("audit_trail", []) if "Entity Name" in c.get("check", "")), None)
+        if name_check:
+            audit_data.append({
+                "Stage": "Phase 9 Forensic",
+                "Rule Checked": name_check["check"],
+                "Status": name_check["status"],
+                "Finding Details": name_check.get("reason") or "Legal entity name matches across certificates."
+            })
+        elif norm_gst_name and norm_pan_name:
+            name_res = consistency_engine.check_entity_name_consistency(norm_gst_name, norm_pan_name, "GST Certificate", "PAN Card")
+            audit_data.append({
+                "Stage": "Phase 9 Forensic",
+                "Rule Checked": name_res["check"],
+                "Status": name_res["status"],
+                "Finding Details": name_res.get("reason") or "Legal entity name matches across certificates."
+            })
+
+        # Turnover Consistency (if Balance Sheet provided)
+        to_check = next((c for c in p9_result.get("audit_trail", []) if "Turnover" in c.get("check", "")), None)
+        if to_check:
+            audit_data.append({
+                "Stage": "Phase 9 Forensic",
+                "Rule Checked": to_check["check"],
+                "Status": to_check["status"],
+                "Finding Details": to_check.get("reason") or "Satisfied without conflict."
+            })
+
+        # Append any other forensic checks present in p9 audit_trail
         for c in p9_result.get("audit_trail", []):
-            if "Turnover" in c.get("check", ""):
+            if "Turnover" not in c.get("check", "") and "Entity Name" not in c.get("check", "") and "PAN" not in c.get("check", ""):
                 audit_data.append({
                     "Stage": "Phase 9 Forensic",
                     "Rule Checked": c["check"],
                     "Status": c["status"],
-                    "Finding Details": c.get("reason") or "Turnover variance within allowable threshold."
+                    "Finding Details": c.get("reason") or "Satisfied without conflict."
                 })
 
         # Missing optional documents do not automatically cause total failure
         hard_failures = [a for a in audit_data if a["Status"] == "FAIL"]
-        pending_reviews = [a for a in audit_data if a["Status"] in ["PENDING_REVIEW", "NOT_VERIFIED"]]
+        pending_reviews = [a for a in audit_data if a["Status"] in ["PENDING_REVIEW", "NOT_VERIFIED", "REVIEW"]]
+        minor_discrepancies = [a for a in audit_data if a["Status"] == "REVIEW"]
+
+        # Discrepancies count includes hard failures as well as minor/review discrepancies
+        total_discrepancies_count = len(hard_failures) + len(minor_discrepancies)
+        if len(p9_result.get("discrepancies", [])) > total_discrepancies_count:
+            total_discrepancies_count = len(p9_result.get("discrepancies", []))
 
         if len(hard_failures) > 0:
             compliance_status = "FLAGGED"
@@ -813,7 +849,7 @@ class DocumentStagingQueue:
         results = {
             "is_verified": True,
             "compliance_status": compliance_status,
-            "discrepancies_count": len(hard_failures),
+            "discrepancies_count": total_discrepancies_count,
             "pending_review_count": len(pending_reviews),
             "audit_data": audit_data,
             "all_lineage": all_lineage,

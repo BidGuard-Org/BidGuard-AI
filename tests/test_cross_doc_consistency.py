@@ -71,3 +71,29 @@ def test_entity_name_mismatch(consistency_engine):
     )
     assert res["status"] == "FAIL"
     assert res["passed"] is False
+
+def test_borderline_fuzzy_name_variation_review(consistency_engine):
+    """When entity names have minor abbreviation or legal suffix variation (70% - 90% match),
+    status is marked as REVIEW, severity as MEDIUM, and an active discrepancy note is flagged."""
+    res = consistency_engine.check_entity_name_consistency(
+        "Apex Buildcon Pvt Ltd", "APEX BUILDCON PRIVATE LIMITED", "GST Certificate", "PAN Card"
+    )
+    assert res["status"] == "REVIEW"
+    assert res["severity"] == "MEDIUM"
+    assert res["passed"] is False
+    assert res["discrepancy_detected"] is True
+    assert 70.0 <= res["similarity_score"] < 90.0
+    assert "Minor name variation detected" in res["reason"]
+
+    # Verify inclusion in evaluate_dossier_consistency discrepancies
+    dossier = {
+        "pan_card": {"pan_number": "AABCA5678B", "legal_name": "APEX BUILDCON PRIVATE LIMITED"},
+        "gst_certificate": {"gstin": "08AABCA5678B1ZT", "legal_name": "Apex Buildcon Pvt Ltd", "annual_turnover": 10.22},
+        "balance_sheet": {"audited_turnover": 9.80}
+    }
+    report = consistency_engine.evaluate_dossier_consistency(dossier)
+    assert report["is_fully_consistent"] is False
+    assert report["inconsistency_count"] == 1
+    assert len(report["discrepancies"]) == 1
+    assert report["discrepancies"][0]["flag"] == "NAME_VARIATION_REVIEW"
+    assert report["discrepancies"][0]["severity"] == "MEDIUM"

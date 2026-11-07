@@ -266,10 +266,10 @@ def print_dossier_report(d: Dict[str, Any]):
     print("  " + "-" * 74)
     for check in d["p9_result"].get("audit_trail", []):
         st = check.get("status", "UNKNOWN")
-        tag = "[PASS]" if st == "PASS" else "[FAIL]"
+        tag = "[PASS]" if st == "PASS" else ("[REVIEW]" if st == "REVIEW" else "[FAIL]")
         ch = check.get("check", "")
         reason = check.get("reason") or "Satisfied without conflict."
-        print(f"  {tag:<7} {ch}")
+        print(f"  {tag:<8} {ch}")
         if st != "PASS":
             print(f"          -> Finding: {reason}")
 
